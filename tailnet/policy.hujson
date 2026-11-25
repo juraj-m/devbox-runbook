@@ -1,0 +1,78 @@
+// Tailnet access policy: an example to adapt. Replace you@github with your
+// own login (Tailscale shows it under Users), keep or drop the prod parts.
+//
+// Source of truth is this file: apply it with `make apply` in this directory
+// (Tailscale API; see docs/ARCHITECTURE.md, "Tailscale"), never by editing in
+// the admin console, or the repo copy goes stale and the next apply reverts
+// the change. The API runs the `tests` block and rejects the policy if any
+// test fails.
+//
+// Default is deny: anything not granted below is blocked. In particular,
+// tagged servers can reach nothing; replies to connections you open are fine.
+{
+	"tagOwners": {
+		// The coding box. Holds no prod data and no prod credentials.
+		"tag:dev": ["autogroup:admin"],
+		// Production servers, if you put them on the tailnet too: reachable
+		// only by you, only on 22, never from tag:dev.
+		"tag:prod": ["autogroup:admin"],
+	},
+
+	"grants": [
+		// You -> the dev box: everything (SSH, mosh, dev servers, the
+		// control page).
+		{
+			"src": ["you@github"],
+			"dst": ["tag:dev"],
+			"ip": ["*"],
+		},
+		// You -> prod: SSH only.
+		{
+			"src": ["you@github"],
+			"dst": ["tag:prod"],
+			"ip": ["tcp:22"],
+		},
+		// Your personal devices reach each other on nothing. Add a grant per
+		// port if you need one (a photo server on the laptop for the phone).
+	],
+
+	"ssh": [
+		// Tailscale SSH to the dev box, as the dev user or as root (the box/
+		// make targets). "check" means re-authenticate with the identity
+		// provider (GitHub with a hardware key, say) every 12 h; a custom
+		// checkPeriod needs a paid plan, 12 h is the free default.
+		{
+			"action": "check",
+			"src": ["you@github"],
+			"dst": ["tag:dev"],
+			"users": ["dev", "root"],
+		},
+		// Tailscale SSH to prod, as root only. Prod's own OpenSSH is closed to
+		// the internet and Tailscale SSH takes over port 22 on the tailnet,
+		// so authorized_keys no longer decide who gets in; this rule does.
+		{
+			"action": "check",
+			"src": ["you@github"],
+			"dst": ["tag:prod"],
+			"users": ["root"],
+		},
+	],
+
+	"tests": [
+		{
+			"src": "you@github",
+			"accept": ["tag:dev:22", "tag:dev:4200", "tag:dev:7070", "tag:prod:22"],
+			"deny": ["tag:prod:443", "you@github:22", "you@github:5900"],
+		},
+		{
+			// The dev box must never reach prod or your personal devices.
+			"src": "tag:dev",
+			"deny": ["tag:prod:22", "tag:prod:443", "you@github:22", "you@github:5900"],
+		},
+		{
+			// Prod reaches nothing: not the dev box, not your devices.
+			"src": "tag:prod",
+			"deny": ["tag:dev:22", "tag:dev:4200", "you@github:22"],
+		},
+	],
+}

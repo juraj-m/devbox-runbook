@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>devbox</title>
+<style>
+  :root {
+    --ink: #111; --muted: #5c5c5c; --line: #d9d9d9; --bg: #fff; --row: #f4f4f4;
+    --linux: #7d7d7d; --docker: #4f6d86; --other: #b5b5b5;
+    --s0: #b4552d; --s1: #2f7d5b; --s2: #7a4fa0; --s3: #a8862a; --s4: #2c6fb0; --s5: #a03e6b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         color: var(--ink); background: var(--bg); -webkit-text-size-adjust: 100%; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px 14px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  .summary { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .status { margin-left: auto; display: flex; gap: 10px; align-items: baseline; color: var(--muted); font-size: 13px; }
+  button { font: inherit; font-size: 13px; color: var(--ink); background: var(--bg); border: 1px solid var(--ink);
+           border-radius: 4px; padding: 3px 10px; cursor: pointer; }
+  .banner { margin: 12px 0 0; padding: 8px 10px; border: 1px solid var(--ink); border-left-width: 4px; }
+
+  /* The box's memory: one segment per top-level group, then what's free. */
+  .bar { display: flex; height: 22px; margin: 14px 0 8px; border: 1px solid var(--ink); }
+  .legend { margin-top: 10px; }
+  .bar span { display: block; height: 100%; min-width: 0; border-right: 1px solid var(--bg); }
+  .bar .free { flex-grow: 1; border-right: 0;
+               background: repeating-linear-gradient(135deg, #fff 0 4px, #e3e3e3 4px 5px); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .legend i { display: inline-block; width: 10px; height: 10px; margin-right: 5px; vertical-align: -1px;
+              border: 1px solid var(--ink); }
+
+  /* The tree: name | memory | CPU, with each row's share of the box under its name. */
+  .tree { margin-top: 12px; border-top: 1px solid var(--ink); }
+  /* minmax(0, ...): a long command line wraps instead of widening the page. */
+  .head, .row { display: grid; grid-template-columns: minmax(0, 1fr) 124px 46px; gap: 8px; align-items: center; }
+  .num .own { color: var(--muted); }
+  .k-process .num .sub { color: var(--ink); }
+  .head { font-size: 12px; color: var(--muted); padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .head span:not(:first-child), .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .row { padding: 5px 0; border-bottom: 1px solid var(--line); cursor: default; }
+  .row.open-able { cursor: pointer; }
+  .row.open-able:hover { background: var(--row); }
+  .name { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+  .name .t { overflow-wrap: anywhere; }
+  .twisty { flex: none; width: 14px; color: var(--ink); font-size: 13px; line-height: 1; }
+  .share { grid-column: 1 / -1; height: 3px; margin-top: 2px; }
+  .share b { display: block; height: 100%; }
+  .num.cpu { color: var(--muted); }
+  .note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); padding-left: 18px; }
+
+  .k-stack > .name { font-weight: 650; font-size: 16px; }
+  .k-base > .name, .k-docker > .name, .k-other > .name { font-weight: 650; }
+  .k-part > .name .t { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .k-process > .name .t { font: 12.5px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .k-process .num { font-size: 12.5px; color: var(--muted); }
+  .pid { color: var(--muted); font: 11px ui-monospace, Menlo, monospace; }
+  .tag { font-size: 11px; border: 1px solid var(--muted); border-radius: 3px; padding: 0 4px; color: var(--muted);
+         font-weight: 400; white-space: nowrap; }
+  /* Job states: by weight and border as well as colour (e-ink). */
+  .tag.job-running { color: var(--ink); border-color: var(--ink); }
+  .tag.job-failed, .tag.job-lost { color: #fff; background: #a3261b; border-color: #a3261b; font-weight: 600; }
+  .tag.job-ok { border-style: dashed; }
+  /* The Claude plan: the app's two bars, then each session's spend. */
+  /* Cards: each part of the page, collapsed to its key figures; a click
+     on the heading opens it (kept per browser). */
+  .card { margin: 12px 0 0; border: 1px solid var(--ink); }
+  .card-h { margin: 0; font-size: 16px; }
+  .card-btn { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; width: 100%;
+              padding: 10px 12px; border: 0; border-radius: 0; background: var(--bg); color: var(--ink);
+              font: inherit; text-align: left; cursor: pointer; }
+  .card-btn:hover { background: var(--row); }
+  .card-btn:focus-visible { outline: 2px solid var(--ink); outline-offset: -4px; }
+  .card-btn .tw { flex: none; width: 14px; font-size: 14px; line-height: 1; transition: transform 0.15s ease-out; }
+  .card-btn[aria-expanded="true"] .tw { transform: rotate(90deg); }
+  .card-t { font-size: 16px; font-weight: 650; }
+  .card-sum { flex: 1 1 auto; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px 12px;
+              font-size: 13px; font-weight: 400; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .card-sum b { color: var(--ink); font-weight: 600; }
+  .card-sum .bad, .card-sum .bad b { color: #a3261b; font-weight: 600; }
+  .legend .bad { color: #a3261b; font-weight: 600; }
+  .card-peek { padding: 0 12px 10px; }
+  .card-peek .bar { margin: 0; }
+  .card-body { padding: 0 12px 12px; border-top: 1px solid var(--line); }
+  h2 { font-size: 16px; margin: 0; }
+  .asof { color: var(--muted); font-size: 13px; margin: 8px 0 0; font-variant-numeric: tabular-nums; }
+  .notes p { margin: 10px 0 0; font-size: 12px; color: var(--muted); max-width: 70ch; }
+  .limit { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; margin: 8px 0 10px; }
+  .limit .when { color: var(--muted); font-size: 13px; margin-left: 6px; }
+  .limit .pct { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .meter { grid-column: 1 / -1; height: 10px; border: 1px solid var(--ink); }
+  .meter b { display: block; height: 100%; background: var(--ink); }
+  .meter.high b { background: #a3261b; }
+  .limit .left { grid-column: 1 / -1; margin-top: 2px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .none { color: var(--muted); font-size: 13px; margin: 8px 0; }
+  .sess .head, .sess .row { grid-template-columns: minmax(0, 1fr) 64px 64px; }
+  .sess .row.ended { color: var(--muted); }
+  .sess .stack { font-weight: 650; }
+  .sess .name { flex-wrap: wrap; row-gap: 3px; }
+  /* Memory at peaks: what runs now against what it has taken at its peaks. */
+  #peaks .head, #peaks .row { grid-template-columns: minmax(0, 1fr) 64px 64px 64px; }
+  #peaks .lead { margin: 8px 0; font-variant-numeric: tabular-nums; }
+  /* The name keeps its width; its tags wrap under it. */
+  #peaks .name { flex-wrap: wrap; row-gap: 3px; }
+  #peaks .name .t { flex: none; }
+  #peaks .lead.short { color: #a3261b; font-weight: 600; }
+  #peaks .sub-h { margin-top: 12px; }
+  #peaks .facts { margin: 8px 0 4px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #peaks .facts p { margin: 3px 0; }
+  /* Claude sessions in a stack (ws claude): one line each, under the stack. */
+  /* min-width 0 all the way down: the command line scrolls, the row doesn't overflow. */
+  .cs { flex-basis: 100%; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  .cs > .cs-row { min-width: 0; }
+  .cs-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 6px 8px;
+            border: 1px solid var(--line); border-left: 3px solid var(--line); }
+  .cs-row.st-working { border-left-color: var(--ink); }
+  .cs-row.st-needs { border-left-color: #a3261b; }
+  .cs-row.st-ended { color: var(--muted); }
+  .cs-row .cs-name { font-weight: 600; font-size: 13px; }
+  .tag.cs-working { color: var(--ink); border-color: var(--ink); }
+  .tag.cs-needs { color: #fff; background: #a3261b; border-color: #a3261b; font-weight: 600; }
+  .tag.cs-finished { border-style: dashed; }
+  .cs-row .cs-msg { font-size: 12px; color: #a3261b; }
+  .cs-row .cs-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
+  .cs-row a.open { font-size: 13px; color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
+  .cs-row .cmd { flex-basis: 100%; display: flex; gap: 6px; align-items: center; min-width: 0; }
+  .cs-row .cmd code { flex: 1 1 0; min-width: 0; overflow-x: auto; white-space: nowrap; font-size: 11.5px;
+                      padding: 3px 6px; background: var(--row); border: 1px solid var(--line); }
+  /* Stacks: start and stop. */
+  .st { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 0;
+        border-top: 1px solid var(--line); }
+  .st:first-of-type { border-top: 0; }
+  .st .who { flex: 1 1 260px; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+  .st .sname { font-weight: 650; }
+  .st .about { flex-basis: 100%; font-size: 12px; color: var(--muted); }
+  .st .acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-left: auto; }
+  .st label { font-size: 13px; white-space: nowrap; }
+  .st button:disabled { color: var(--muted); border-color: var(--line); cursor: default; }
+  .st button.primary { background: var(--ink); color: var(--bg); }
+  .st button.primary:disabled { background: none; color: var(--muted); }
+  .tag.up { color: var(--ink); border-color: var(--ink); }
+  .st .msg { flex-basis: 100%; font-size: 13px; }
+  .st .msg.bad { color: #a3261b; }
+  .st pre { flex-basis: 100%; margin: 0; max-height: 50vh; overflow: auto; padding: 8px; font-size: 11.5px;
+            line-height: 1.35; background: var(--row); border: 1px solid var(--line); white-space: pre-wrap;
+            overflow-wrap: anywhere; }
+  @media (max-width: 520px) {
+    body { font-size: 14px; }
+    .head, .row { grid-template-columns: minmax(0, 1fr) 62px 36px; gap: 6px; }
+    /* A long command keeps the row's width; its pid goes under it, not beside. */
+    .k-process > .name { flex-wrap: wrap; }
+    .k-process > .name .t { flex: 1 1 calc(100% - 20px); }
+    .k-process > .name .pid { margin-left: 20px; }
+    /* No room for both on one line: own above, with what's under it below. */
+    .num .own { display: block; font-size: 11px; }
+    .status { margin-left: 0; width: 100%; }
+    /* The figures under the title, from its left edge: wrapped right-aligned they're ragged. */
+    .card-sum { flex-basis: 100%; justify-content: flex-start; padding-left: 24px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="host">devbox</h1>
+    <span class="summary" id="summary">waiting for the first sample…</span>
+    <span class="status"><span id="age"></span><button id="pause" type="button">Pause</button></span>
+  </header>
+  <div class="banner" id="banner" hidden></div>
+  <section class="card" id="stacks" hidden>
+    <h2 class="card-h"><button type="button" class="card-btn" aria-expanded="false" aria-controls="stacks-body"><span class="tw" aria-hidden="true">▸</span><span class="card-t">Stacks</span><span class="card-sum" id="stacks-sum"></span></button></h2>
+    <div class="card-body" id="stacks-body" hidden>
+      <div id="stack-rows"></div>
+    </div>
+  </section>
+  <section class="card" id="plan" hidden>
+    <h2 class="card-h"><button type="button" class="card-btn" aria-expanded="false" aria-controls="plan-body"><span class="tw" aria-hidden="true">▸</span><span class="card-t">Claude plan</span><span class="card-sum" id="plan-sum"></span></button></h2>
+    <div class="card-body" id="plan-body" hidden>
+      <div class="asof" id="plan-asof"></div>
+      <div id="limits"></div>
+      <div class="sess" id="sessions"></div>
+    </div>
+  </section>
+  <section class="card" id="peaks" hidden>
+    <h2 class="card-h"><button type="button" class="card-btn" aria-expanded="false" aria-controls="peaks-body"><span class="tw" aria-hidden="true">▸</span><span class="card-t">Memory at peaks</span><span class="card-sum" id="peaks-sum"></span></button></h2>
+    <div class="card-body" id="peaks-body" hidden>
+      <div class="asof" id="peaks-asof"></div>
+      <div id="peaks-detail"></div>
+    </div>
+  </section>
+  <section class="card" id="tree">
+    <h2 class="card-h"><button type="button" class="card-btn" aria-expanded="false" aria-controls="tree-body"><span class="tw" aria-hidden="true">▸</span><span class="card-t">What runs</span><span class="card-sum" id="tree-sum"></span></button></h2>
+    <div class="card-peek"><div class="bar" id="bar" aria-hidden="true"></div></div>
+    <div class="card-body" id="tree-body" hidden>
+      <div class="legend" id="legend"></div>
+      <div class="tree">
+        <div class="head"><span>What runs</span><span>Memory</span><span>CPU</span></div>
+        <div id="rows"></div>
+      </div>
+    </div>
+  </section>
+  <section class="card" id="disk" hidden>
+    <h2 class="card-h"><button type="button" class="card-btn" aria-expanded="false" aria-controls="disk-body"><span class="tw" aria-hidden="true">▸</span><span class="card-t">Disk</span><span class="card-sum" id="disk-sum"></span></button></h2>
+    <div class="card-peek"><div class="bar" id="disk-bar" aria-hidden="true"></div></div>
+    <div class="card-body" id="disk-body" hidden>
+      <div class="legend" id="disk-legend"></div>
+      <p class="none" id="disk-note"></p>
+    </div>
+  </section>
+  <section class="card" id="notes">
+    <h2 class="card-h"><button type="button" class="card-btn" aria-expanded="false" aria-controls="notes-body"><span class="tw" aria-hidden="true">▸</span><span class="card-t">Reading this page</span><span class="card-sum" id="notes-sum"></span></button></h2>
+    <div class="card-body" id="notes-body" hidden>
+      <div class="notes">
+      <p>
+    Memory is what stopping it gives back (without the page cache, which the kernel drops anyway).
+    A process's figure is its resident memory, a detail inside its group: shared pages count in each.
+    With processes under it, two figures: its own / with what runs under it.
+    CPU is in cores: 1.0 is one core busy. <b>outside ws</b>: started by hand, not with
+    <code>ws start</code>; grouped by the folder it runs in.
+      </p>
+      <p>
+    The buttons run <code>ws start</code>, <code>stop</code>, <code>pause</code>, <code>resume</code>
+    or <code>switch</code> on the box as a job of the stack: <code>ws jobs NAME</code> and
+    <code>ws logs NAME start</code> show it there too. Start runs the stack's start commands again
+    even when it runs (they restart what's up). Pause freezes its servers and containers and moves
+    their memory to swap; Resume brings it back in seconds instead of a cold start's minutes.
+    Switch to pauses the other running stacks first. Nothing refuses for lack of memory: the
+    confirmation says what's free and, from the recorded peaks, whether the stack has the room.
+      </p>
+      <p>
+    Memory at peaks: the control server keeps every sample a minute at a time (<code>ws peaks</code>
+    on the box says the same). A peak is the 99th percentile of the minutes' highest, so one odd
+    minute doesn't set it; <b>More</b> is how much more than now that is. Together they're what to keep
+    free for all of them to peak at once. A stack is active in a minute its servers and containers
+    used twice their median CPU and at least a tenth of a core: some idle servers poll. A Claude session with less than half an hour recorded borrows
+    every session's peak. Paused minutes don't count.
+      </p>
+      <p>
+    The Claude plan's limits are the account's, as Claude Code's status line last reported them
+    (<code>ws statusline</code>, on a session's reply, here or on the Mac): claude.ai's use counts
+    in them too, and isn't listed. The Mac's sessions arrive within a minute or so of their reply.
+    A session's spend is Claude Code's estimate at list price, a measure of relative use on a
+    subscription, not a bill; its share is of what the listed sessions spent in the window.
+    <b>Work left</b>: the rest of the bar at what 1% has cost in the recorded windows of the last two
+    weeks (spend over how far the bar moved). claude.ai's use moves the bar without being recorded,
+    so it comes out low.
+      </p>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const KEY = "devbox-control-open";
+let open = {};
+try { open = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { open = {}; }
+let paused = false, last = null, timer = null, interval = 3;
+
+const gb = (n) => n >= 2 ** 30 ? (n / 2 ** 30).toFixed(1) + " GB"
+  : n > 0 && n < 2 ** 20 ? "<1 MB" : Math.round(n / 2 ** 20) + " MB";
+// Idle is blank, not "0": the busy ones stand out.
+const cores = (c) => c == null || c < 0.005 ? "" : c.toFixed(2);
+
+// ---------------------------------------------------------- cards
+// Each part of the page is a card: collapsed to its key figures (the
+// summary in its heading), opened by a click on the heading. Which are open
+// is kept per browser.
+const CARDS = "devbox-control-cards";
+let cards = {};
+try { cards = JSON.parse(localStorage.getItem(CARDS)) || {}; } catch (e) { cards = {}; }
+
+function setCard(id, isOpen) {
+  $(id).querySelector(".card-btn").setAttribute("aria-expanded", String(isOpen));
+  $(`${id}-body`).hidden = !isOpen;
+}
+
+// One figure in a summary: text and {b: "the number"} parts; bad: in red.
+const fig = (bad, ...parts) => ({ bad, parts });
+
+function summary(id, figs) {
+  $(`${id}-sum`).replaceChildren(...figs.filter(Boolean).map((f) => {
+    const span = el("span", f.bad ? "bad" : null);
+    for (const p of f.parts) span.append(typeof p === "string" ? document.createTextNode(p) : el("b", null, p.b));
+    return span;
+  }));
+}
+
+// Colours: Linux, Docker, the rest fixed; stacks in order.
+function colour(node, i) {
+  if (node.kind === "base") return "var(--linux)";
+  if (node.kind === "docker") return "var(--docker)";
+  if (node.kind === "other") return "var(--other)";
+  return `var(--s${i % 6})`;
+}
+
+// Open by default: the top level, stacks, and their parts; closed: units
+// with processes, Linux and Docker (many small services).
+function isOpen(id, node, depth) {
+  if (id in open) return open[id];
+  if (depth === 0) return node.kind === "stack";
+  return node.kind === "part";
+}
+
+// A ws run job: "running 3m12s", "failed (exit 1) 40s", "ok 2m05s".
+function jobLabel(n) {
+  let s = n.state;
+  if (s === "failed" && n.oom) s += ": over the memory cap";
+  else if (s === "failed" && n.exit != null) s += n.exit < 0 ? ` (signal ${-n.exit})` : ` (exit ${n.exit})`;
+  const e = n.elapsed;
+  if (e != null) s += e >= 60 ? ` ${Math.floor(e / 60)}m${String(e % 60).padStart(2, "0")}s` : ` ${e}s`;
+  return s;
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function row(node, id, depth, hue, total) {
+  const kids = node.children || [];
+  const r = el("div", `row k-${node.kind}` + (kids.length ? " open-able" : ""));
+  const name = el("div", "name");
+  name.style.paddingLeft = depth * 16 + "px";
+  const o = kids.length && isOpen(id, node, depth);
+  name.append(el("span", "twisty", kids.length ? (o ? "▾" : "▸") : ""));
+  name.append(el("span", "t", node.name));
+  if (node.pid) name.append(el("span", "pid", node.pid));
+  if (node.name === "outside ws") name.append(el("span", "tag", "not via ws"));
+  if (node.state) name.append(el("span", `tag job-${node.state}`, jobLabel(node)));
+  const cs = claudeIn(node);
+  if (cs) name.append(el("span", "tag", cs.five_hour ? `Claude: ${usd(cs.five_hour)} in 5 h` : "Claude"));
+  r.append(name);
+  // A process with processes under it: its own memory / with them (npm's
+  // wrapper is 67 MB, the ng serve under it 1.9 GB). A leaf: one number.
+  const under = node.kind === "process" && kids.length && node.tree_mem > node.mem;
+  if (under) {
+    const m = el("span", "num");
+    m.append(el("span", "own", gb(node.mem) + " /"), document.createTextNode(" "), el("span", "sub", gb(node.tree_mem)));
+    m.title = `${gb(node.mem)} its own, ${gb(node.tree_mem)} with what runs under it`;
+    r.append(m);
+  } else {
+    r.append(el("span", "num", gb(node.mem)));
+  }
+  r.append(el("span", "num cpu", cores(node.cpu)));
+  if (node.kind !== "process") {
+    const share = el("div", "share");
+    const b = el("b");
+    b.style.width = Math.min(100, (node.mem / total) * 100) + "%";
+    b.style.background = hue;
+    share.append(b);
+    r.append(share);
+  }
+  if (node.note && (depth === 0 || node.kind === "kernel")) r.append(el("div", "note", node.note));
+  if (kids.length) {
+    r.addEventListener("click", () => {
+      open[id] = !o;
+      try { localStorage.setItem(KEY, JSON.stringify(open)); } catch (e) { /* private mode */ }
+      draw();
+    });
+  }
+  return { r, o };
+}
+
+function rowsOf(node, id, depth, hue, total, out) {
+  const { r, o } = row(node, id, depth, hue, total);
+  out.push(r);
+  if (o) for (const c of node.children) rowsOf(c, id + "/" + c.name + (c.pid || ""), depth + 1, hue, total, out);
+}
+
+// "claude-opus-5-5" → "Opus 5.5", "claude-fable-5-2" → "Fable 5.2".
+function model(id) {
+  if (!id) return "";
+  const m = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(id);
+  return m ? `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}` : id;
+}
+const usd = (n) => n == null ? "" : n === 0 ? "–" : n < 0.01 ? "<$0.01" : "$" + n.toFixed(2);
+// A time, with its day when it isn't today's: "15:45", "Thu 15:45".
+function clock(t) {
+  const d = new Date(t * 1000);
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString() ? hm
+    : `${d.toLocaleDateString([], { weekday: "short" })} ${hm}`;
+}
+
+// When a window resets, as the app says it: "in 43 min", "in 2 h 05", "Sat 03:20".
+function resets(t) {
+  const m = Math.max(0, Math.floor((t - Date.now() / 1000) / 60));
+  if (m < 60) return `resets in ${m} min`;
+  if (m < 24 * 60) return `resets in ${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")}`;
+  // clock() has the day already: a time past a day away isn't today's.
+  return "resets " + clock(t);
+}
+
+// The session a claude process in the tree is, by pid.
+let byPid = {};
+
+// The Claude session in a row: its own process, or, for a unit (a tmux
+// pane, a login), the one inside it, so a closed pane shows it too.
+function claudeIn(node) {
+  if (node.kind === "process") return byPid[node.pid];
+  if (!["unit", "process"].includes(node.kind)) return undefined;
+  const stack = [...(node.children || [])];
+  while (stack.length) {
+    const n = stack.pop();
+    if (n.kind === "process" && byPid[n.pid]) return byPid[n.pid];
+    stack.push(...(n.children || []));
+  }
+  return undefined;
+}
+
+function drawPlan(c) {
+  const plan = $("plan");
+  plan.hidden = false;
+  const limits = $("limits"), sess = $("sessions");
+  limits.replaceChildren(); sess.replaceChildren();
+  byPid = {};
+  if (!c) {
+    limits.append(el("p", "none", last && last.claude_error ? `Can't read the usage records (${last.claude_error}).` : ""));
+    summary("plan", [fig(!!(last && last.claude_error), "no reading")]);
+    return;
+  }
+  const lim = c.limits || {};
+  const f5 = lim.five_hour, wk = lim.seven_day;
+  summary("plan", f5 || wk ? [
+    f5 && fig(f5.pct >= 80, "5 h ", { b: `${Math.round(f5.pct)}%` }, ` · ${resets(f5.resets_at)}`),
+    f5 && f5.left_usd != null && fig(f5.pct >= 80, "≈ ", { b: `$${Math.round(f5.left_usd)}` }, " of work left"),
+    wk && fig(wk.pct >= 80, "week ", { b: `${Math.round(wk.pct)}%` }),
+  ] : [fig(false, "no reading yet")]);
+  const asof = Math.max(0, ...Object.values(lim).map((v) => v.as_of));
+  $("plan-asof").textContent = asof ? `as of ${clock(asof)}` : "";
+  const shown = [["five_hour", "Current session (5 h)"], ["seven_day", "Weekly · all models"]].filter(([w]) => lim[w]);
+  if (!shown.length) limits.append(el("p", "none",
+    "No reading yet: the limits arrive with a Claude session's next reply (ws statusline)."));
+  for (const [w, label] of shown) {
+    const v = lim[w];
+    const r = el("div", "limit");
+    const name = el("span", null, label);
+    name.append(el("span", "when", resets(v.resets_at)));
+    r.append(name, el("span", "pct", `${Math.round(v.pct)}% used`));
+    const m = el("div", "meter" + (v.pct >= 80 ? " high" : ""));
+    const b = el("b"); b.style.width = Math.min(100, v.pct) + "%";
+    m.append(b); r.append(m);
+    const cal = (c.calibration || {})[w];
+    if (v.left_usd != null && cal) {
+      // An estimate: whole dollars.
+      r.append(el("div", "left", `≈ $${Math.round(v.left_usd)} of work left, at ${usd(cal.usd_per_pct)} per 1% ` +
+        `(from ${cal.windows} window${cal.windows === 1 ? "" : "s"} recorded)`));
+    }
+    limits.append(r);
+  }
+  const list = c.sessions || [];
+  if (!list.length) return;
+  const head = el("div", "head");
+  head.append(el("span", null, "Claude sessions, what they spent"), el("span", null, "5 h"), el("span", null, "Week"));
+  sess.append(head);
+  for (const s of list) {
+    if (s.running && s.pid) byPid[s.pid] = s;
+    const r = el("div", "row" + (s.running ? "" : " ended"));
+    const name = el("div", "name");
+    name.append(el("span", "stack", s.stack || "other"));
+    const where = s.name || (s.cwd || "").split("/").slice(-1)[0];
+    if (where && where !== s.stack) name.append(el("span", "t", where));
+    if (s.model) name.append(el("span", "tag", model(s.model)));
+    // Another machine's (the Mac's): which, and when it last replied; whether
+    // it has ended can't be seen from here.
+    if (s.remote) name.append(el("span", "tag", "on " + (s.host || "another machine").replace(/\.local$/, "")));
+    if (s.context_pct != null && s.running) name.append(el("span", "tag", `context ${Math.round(s.context_pct)}%`));
+    name.append(el("span", "tag", s.remote ? (s.running ? "active" : `last reply ${clock(s.updated)}`)
+      : !s.running ? "ended" : s.idle ? `idle since ${clock(s.updated)}` : "active"));
+    r.append(name, el("span", "num", usd(s.five_hour)), el("span", "num", usd(s.seven_day)));
+    const sh = s.share && s.share.five_hour;
+    if (sh && list.filter((x) => x.five_hour > 0).length > 1) {
+      r.append(el("div", "note", `${Math.round(sh * 100)}% of the listed sessions' spend in this window`));
+    }
+    sess.append(r);
+  }
+}
+
+// ---------------------------------------------------------- peaks
+// /api/peaks, in MB: fetched once a minute, drawn with the rest.
+let peaks = null, peaksAt = 0;
+const mb = (n) => n == null ? "–" : gb(n * 2 ** 20);
+const pctOf = (a, n) => n ? Math.round((100 * a) / n) + "%" : "–";
+
+function drawPeaks() {
+  const sec = $("peaks"), body = $("peaks-detail");
+  if (!peaks) { sec.hidden = true; return; }
+  sec.hidden = false;
+  body.replaceChildren();
+  const r = peaks.report;
+  if (!r) {
+    body.append(el("p", "none", `Can't read the peaks (${peaks.error || "no report"}).`));
+    summary("peaks", [fig(true, "can't read the peaks")]);
+    return;
+  }
+  // Collapsed: what's left for more once what runs could peak.
+  const hasPeak = r.running.some((x) => x.peak != null);
+  summary("peaks", !r.minutes ? [fig(false, "nothing recorded yet")]
+    : !hasPeak ? [fig(false, { b: mb(r.available) }, " free"), fig(false, "peaks not known yet")]
+    : [r.spare < 0 ? fig(true, { b: mb(-r.spare) }, " short at the peaks")
+         : fig(false, { b: mb(r.spare) }, " to spare at the peaks"),
+       fig(false, `what runs may take ${mb(r.need)} more`)]);
+  const hours = r.minutes / 60;
+  $("peaks-asof").textContent = r.minutes
+    ? `last ${r.days} days · ${hours >= 1 ? Math.round(hours) + " h" : r.minutes + " min"} recorded` : "";
+  if (!r.minutes) {
+    body.append(el("p", "none", "Nothing recorded yet: a minute at a time from now on."));
+    return;
+  }
+  const known = r.running.filter((x) => x.peak != null);
+  const lead = el("p", "lead" + (r.spare < 0 ? " short" : ""), `Free now ${mb(r.available)}. ` +
+    (!r.running.length ? "Nothing runs." : !known.length ? "What runs has too little recorded for a peak yet."
+      : `At their peaks, what runs could take ${mb(r.need)} more: ` +
+        (r.spare < 0 ? `${mb(-r.spare)} short.` : `${mb(r.spare)} left for anything else`) +
+        (r.unknown.length ? `, not counting ${r.unknown.join(", ")}.` : ".")));
+  body.append(lead);
+  if (r.running.length) {
+    const head = el("div", "head");
+    head.append(el("span", null, "Running now"), el("span", null, "Now"), el("span", null, "Peak"), el("span", null, "More"));
+    body.append(head);
+    for (const x of r.running) {
+      const row = el("div", "row");
+      const name = el("div", "name");
+      name.append(el("span", "t", x.name));
+      if (x.kind !== "app") name.append(el("span", "tag", x.kind === "claude" ? "Claude" : "job"));
+      if (x.from) name.append(el("span", "tag", "peak of all sessions"));
+      if (x.peak == null) name.append(el("span", "tag", `no peak yet · ${x.minutes} min`));
+      row.append(name, el("span", "num", mb(x.mem)), el("span", "num", mb(x.peak)),
+        el("span", "num", x.more == null ? "–" : mb(x.more)));
+      body.append(row);
+    }
+  }
+  const facts = el("div", "facts");
+  const fact = (t) => facts.append(el("p", null, t));
+  for (const x of r.resume) fact(x.idle_mem == null
+    ? `Resuming ${x.stack}: up to ${mb(x.more)} more, what it has in swap (not seen running yet).`
+    : `Resuming ${x.stack}: about ${mb(x.more)} more (it idles at ${mb(x.idle_mem)}, peaks at ${mb(x.peak)}).`);
+  const jobs = Object.entries(r.jobs).sort((a, b) => b[1].peak - a[1].peak);
+  if (jobs.length) fact(`A ws run job takes up to ${mb(jobs[0][1].peak)} (${jobs[0][0]}).`);
+  if (facts.childNodes.length) body.append(facts);
+
+  const stacks = Object.entries(r.stacks);
+  if (stacks.length) {
+    const head = el("div", "head sub-h");
+    head.append(el("span", null, "Stacks: servers and containers"), el("span", null, "Idle"),
+      el("span", null, "Active"), el("span", null, "Peak"));
+    body.append(head);
+    for (const [n, d] of stacks) {
+      const row = el("div", "row");
+      const name = el("div", "name");
+      name.append(el("span", "t", n), el("span", "tag", `active ${pctOf(d.active_minutes, d.minutes)} of ${Math.round(d.minutes / 60) || "<1"} h`));
+      if (d.cpu_idle != null) name.append(el("span", "tag", `${d.cpu_idle.toFixed(2)} cores idle`));
+      if (d.cpu_active != null) name.append(el("span", "tag", `${d.cpu_active.toFixed(2)} active`));
+      row.append(name, el("span", "num", mb(d.idle_mem)), el("span", "num", mb(d.active_mem)), el("span", "num", mb(d.peak)));
+      row.title = `peak ${clock(d.peak_at)}`;
+      body.append(row);
+    }
+  }
+  const more = el("div", "facts");
+  const c = r.claude;
+  if (c) more.append(el("p", null, `Claude sessions (${r.claude_sessions}): idle ${mb(c.idle_mem)}, active ${mb(c.active_mem)}, ` +
+    `peak ${mb(c.p99)} (highest ${mb(c.peak)}, ${clock(c.peak_at)}).`));
+  if (jobs.length) more.append(el("p", null, "Jobs at their peaks: " + jobs.map(([n, d]) => `${n} ${mb(d.peak)}`).join(", ") + "."));
+  const b = r.box;
+  if (b) more.append(el("p", null, `The box: highest used ${mb(b.used_peak)} (${clock(b.used_peak_at)}), lowest free ` +
+    `${mb(b.avail_min)} (${clock(b.avail_min_at)}), swap up to ${mb(b.swap_peak)}; tasks stalled waiting for memory ` +
+    `${Math.round(b.stall_some_s)} s` + (b.stall_full_s >= 1 ? `, all of them at once ${Math.round(b.stall_full_s)} s.` : ".")));
+  if (more.childNodes.length) body.append(more);
+}
+
+async function fetchPeaks() {
+  if (Date.now() - peaksAt < 60000) return;
+  peaksAt = Date.now();
+  try {
+    const r = await fetch("/api/peaks", { cache: "no-store" });
+    peaks = r.ok ? await r.json() : { report: null, error: `HTTP ${r.status}` };
+  } catch (e) {
+    peaks = peaks || { report: null, error: e.message };
+  }
+}
+
+// ---------------------------------------------------------- start, stop
+// Kept across redraws (every few seconds): what's ticked, what a press
+// answered, an open log.
+const picked = {}, msgs = {}, logs = {}, busy = {}, live = {};
+const ACTIVE = ["queued", "running"];
+const mins = (e) => e >= 60 ? `${Math.floor(e / 60)}m${String(e % 60).padStart(2, "0")}s` : `${e}s`;
+
+const DOING = { start: "starting", stop: "stopping", pause: "pausing", resume: "resuming", switch: "switching to it" };
+const DONE = { start: "started", stop: "stopped", pause: "paused", resume: "resumed", switch: "switched to" };
+// What a stack is now, and which of its last actions leave it so.
+const stateOf = (s) => s.paused ? "paused" : s.running ? "running" : "stopped";
+const LEAVES = { start: "running", resume: "running", switch: "running", pause: "paused", stop: "stopped" };
+
+// The last action: "starting 40s", "start failed (exit 2)", "stopped 14:02".
+function actionTag(a) {
+  if (!a) return null;
+  const now = Date.now() / 1000;
+  if (ACTIVE.includes(a.state)) {
+    const e = a.started_at ? Math.max(0, Math.round(now - a.started_at)) : 0;
+    return el("span", "tag job-running", `${DOING[a.job] || a.job} ${mins(e)}`);
+  }
+  if (a.state === "failed" || a.state === "lost") {
+    return el("span", "tag job-failed", `${a.job} ${a.state}` + (a.state === "failed" && a.exit != null ? ` (exit ${a.exit})` : ""));
+  }
+  // How a finished one went, for half a day.
+  if (!a.ended_at || now - a.ended_at > 12 * 3600) return null;
+  if (a.state === "cancelled") return el("span", "tag", `${a.job} cancelled`);
+  return el("span", "tag job-ok", `${DONE[a.job] || a.job} ${clock(a.ended_at)}`);
+}
+
+function button(text, cls, disabled, onClick) {
+  const b = el("button", cls, text);
+  b.type = "button";
+  b.disabled = disabled;
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+function stackRow(s, t, list) {
+  const r = el("div", "st");
+  const who = el("div", "who");
+  who.append(el("span", "sname", s.name));
+  // A last action that went as the state says: its time in the state's tag
+  // ("stopped since 15:45"), not a second tag saying the same.
+  const a = s.action;
+  const state = stateOf(s);
+  const agrees = a && a.state === "ok" && a.ended_at && LEAVES[a.job] === state;
+  const since = agrees ? ` · since ${clock(a.ended_at)}` : "";
+  if (!s.built) who.append(el("span", "tag", "not set up"));
+  else who.append(el("span", "tag" + (state === "running" ? " up" : ""),
+    (state === "running" ? `running · ${gb(s.mem)}`
+      : state === "paused" ? `paused · ${gb(s.mem)}, ${gb(s.swap)} in swap` : "stopped") + since));
+  // One that went fine but no longer says what the stack is (another
+  // stack's switch paused it since; a ws stop in a shell) is history.
+  const stale = a && a.state === "ok" && !agrees;
+  const at = agrees || stale ? null : actionTag(a);
+  if (at) who.append(at);
+  if (s.about) who.append(el("span", "about", s.about));
+  r.append(who);
+  const active = !!s.action && ACTIVE.includes(s.action.state);
+  const off = active || !!busy[s.name];
+  const acts = el("div", "acts");
+  if (s.built) {
+    const sel = picked[s.name] || (picked[s.name] = new Set());
+    // A paused stack resumes as it was: nothing to add to it.
+    for (const w of state === "paused" ? [] : s.with) {
+      const lab = el("label");
+      lab.title = w.about;
+      const cb = el("input");
+      cb.type = "checkbox";
+      cb.checked = sel.has(w.name);
+      cb.disabled = off;
+      cb.addEventListener("change", () => { if (cb.checked) sel.add(w.name); else sel.delete(w.name); });
+      lab.append(cb, document.createTextNode(` with ${w.name}`));
+      acts.append(lab);
+    }
+    // Switch to: the others paused first. Only where there are others.
+    const others = list.some((x) => x.name !== s.name && x.running && !x.paused);
+    if (state === "paused") {
+      if (others) acts.append(button("Switch to", "primary", off, () => ask(s, "switch", [], t, list)));
+      acts.append(button("Resume", others ? "" : "primary", off, () => ask(s, "resume", [], t, list)));
+    } else {
+      if (state === "stopped" && others) {
+        acts.append(button("Switch to", "primary", off, () => ask(s, "switch", [...sel], t, list)));
+      }
+      acts.append(button(state === "running" ? "Restart" : "Start",
+        state === "running" || others ? "" : "primary", off, () => ask(s, "start", [...sel], t, list)));
+      if (state === "running") acts.append(button("Pause", "", off, () => ask(s, "pause", [], t, list)));
+    }
+    if (state !== "stopped") acts.append(button("Stop", "", off, () => ask(s, "stop", [], t, list)));
+  }
+  if (s.action) acts.append(button(logs[s.name] != null ? "Hide log" : "Log", "", false, () => toggleLog(s)));
+  if (s.built) acts.append(button("New Claude session", "", !!busy[`claude:${s.name}`], () => newClaude(s)));
+  r.append(acts);
+  if (!s.built) r.append(el("div", "msg", `Not on the box yet. There: ws up ${s.name}`));
+  const m = msgs[s.name];
+  if (m) r.append(el("div", "msg" + (m.bad ? " bad" : ""), m.text));
+  if (logs[s.name] != null) r.append(el("pre", null, logs[s.name] || "(no output yet)"));
+  const mine = (last.claude_launched || {})[s.name] || [];
+  if (mine.length) {
+    const box = el("div", "cs");
+    box.append(...mine.map((c) => claudeRow(s, c)));
+    r.append(box);
+  }
+  return r;
+}
+
+function drawStacks(list, t) {
+  const sec = $("stacks"), rows = $("stack-rows");
+  if (!list) {
+    sec.hidden = !last.stacks_error;
+    rows.replaceChildren(el("p", "none", `Can't list the stacks (${last.stacks_error}).`));
+    return;
+  }
+  sec.hidden = !list.length;
+  rows.replaceChildren(...list.map((s) => stackRow(s, t, list)));
+  // Collapsed: what runs and what's paused; an action going on, or one that
+  // failed, in place of the stack's state; the stopped ones counted.
+  let stopped = 0;
+  const figs = list.filter((s) => s.built).map((s) => {
+    const a = s.action;
+    if (a && ACTIVE.includes(a.state)) return fig(false, { b: s.name }, ` ${DOING[a.job] || a.job}…`);
+    if (a && (a.state === "failed" || a.state === "lost")) return fig(true, { b: s.name }, ` ${a.job} ${a.state}`);
+    const st = stateOf(s);
+    if (st === "running") return fig(false, { b: s.name }, ` running ${gb(s.mem)}`);
+    if (st === "paused") return fig(false, `${s.name} paused`);
+    stopped++;
+    return null;
+  });
+  if (stopped) figs.push(fig(false, `${stopped} stopped`));
+  const all = Object.values(last.claude_launched || {}).flat();
+  const needs = all.filter((c) => c.state === "needs input").length;
+  const working = all.filter((c) => c.state === "working").length;
+  if (needs) figs.unshift(fig(true, { b: String(needs) }, ` Claude ${needs === 1 ? "session needs" : "sessions need"} input`));
+  if (working) figs.push(fig(false, `${working} Claude working`));
+  summary("stacks", figs.some(Boolean) ? figs : [fig(false, "nothing running")]);
+}
+
+// ---------------------------------------------------------- Claude sessions
+// ws claude NAME: claude --remote-control in the stack's tmux. Its state
+// comes from its own hooks (claude_sessions.py): working, needs input,
+// finished, ended.
+const CS_CLASS = { working: "working", "needs input": "needs", finished: "finished", starting: "", ended: "" };
+const CS_SHOWN = { finished: "finished, waiting for you", starting: "starting…" };
+
+function claudeRow(s, c) {
+  const row = el("div", `cs-row st-${CS_CLASS[c.state] || c.state.replace(/ .*/, "")}`);
+  row.append(el("span", "cs-name", c.tmux));
+  row.append(el("span", `tag cs-${CS_CLASS[c.state] || ""}`, CS_SHOWN[c.state] || c.state));
+  if (c.state_at) row.append(el("span", "tag", (c.state === "ended" ? "ended " : "since ") + clock(c.state_at)));
+  if (c.message) row.append(el("span", "cs-msg", c.message));
+  const acts = el("div", "cs-acts");
+  if (c.url && c.state !== "ended") {
+    const a = el("a", "open", "Open in Claude");
+    a.href = c.url; a.target = "_blank"; a.rel = "noopener";
+    acts.append(a);
+  } else if (c.state !== "ended") {
+    acts.append(el("span", "tag", "link once it's connected"));
+  }
+  const key = `claude:${s.name}:${c.tmux}`;
+  if (c.waiting === "trust" && c.state !== "ended") {
+    acts.append(button("Trust this folder", "primary", !!busy[key], () => claudeCmd(s, c, "claude-trust",
+      `Trust ${c.dir} for Claude Code? ${c.tmux} asks before it reads or runs anything there. This answers yes, once per folder.`)));
+  }
+  if (c.state !== "ended") {
+    acts.append(button("End", "", !!busy[key], () => claudeCmd(s, c, "claude-end",
+      `End ${s.name} ${c.tmux}? Its claude exits; the conversation stays in its history (claude --resume).`)));
+  }
+  row.append(acts);
+  if (c.state !== "ended") {
+    const cmd = el("div", "cmd");
+    const text = `ssh -t devbox ${c.attach}`;
+    cmd.append(el("code", null, text), button("Copy", "", false, async (e) => {
+      const b = e.currentTarget;
+      try { await navigator.clipboard.writeText(text); b.textContent = "Copied"; } catch (err) { b.textContent = "Copy failed"; }
+      setTimeout(() => { b.textContent = "Copy"; }, 1500);
+    }));
+    row.append(cmd);
+  }
+  return row;
+}
+
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    return { ok: r.ok, text: d.message || `HTTP ${r.status}` };
+  } catch (e) {
+    return { ok: false, text: `Can't reach the box (${e.message}).` };
+  }
+}
+
+async function newClaude(s) {
+  const key = `claude:${s.name}`;
+  busy[key] = true;
+  msgs[s.name] = { text: "Starting a Claude session… (its link comes once Remote Control connects)" };
+  draw();
+  const r = await post(`/api/stacks/${encodeURIComponent(s.name)}/claude`, {});
+  busy[key] = false;
+  msgs[s.name] = r.ok ? null : { text: r.text, bad: true };
+  await tick();
+}
+
+async function claudeCmd(s, c, verb, question) {
+  if (!confirm(question)) return;
+  const key = `claude:${s.name}:${c.tmux}`;
+  busy[key] = true;
+  draw();
+  const r = await post(`/api/stacks/${encodeURIComponent(s.name)}/${verb}`, { tmux: c.tmux });
+  busy[key] = false;
+  msgs[s.name] = r.ok ? null : { text: r.text, bad: true };
+  await tick();
+}
+
+async function ask(s, action, withs, t, list) {
+  const up = list.filter((x) => x.running && !x.paused && x.name !== s.name);
+  const others = up.map((x) => `${x.name} ${gb(x.mem)}`);
+  const free = `Free now: ${gb(t.available)} of ${gb(t.total)}.` + (others.length ? `\nRunning: ${others.join(", ")}.` : "");
+  const w = withs.length ? " with " + withs.join(", ") : "";
+  const q = {
+    stop: `Stop ${s.name}? It uses ${gb(s.mem)} now` + (s.paused ? `, and ${gb(s.swap)} in swap.` : "."),
+    pause: `Pause ${s.name}? Its servers freeze and their memory goes to swap: about ${gb(s.mem)} back ` +
+      `for other stacks. Resume brings it back in seconds; a reboot of the box ends it, as it ends a running one.`,
+    resume: `Resume ${s.name}? Its ${gb(s.swap)} in swap comes back as it's used.\n\n${free}`,
+    switch: `Switch to ${s.name}${s.paused ? "" : w}? First paused: ${up.map((x) => x.name).join(", ")}. ` +
+      `Then ${s.name} ${s.paused ? "resumed" : "started"}.`,
+    start: `${s.running ? "Restart" : "Start"} ${s.name}${w}?\n\n${free}`,
+  }[action];
+  // Whether it has the room, from the recorded peaks (watch.py room()).
+  const room = peaks && peaks.report && peaks.report.room && (peaks.report.room[s.name] || {})[action];
+  if (!confirm(room && room.text && action !== "stop" && action !== "pause" ? `${q}\n\n${room.text}` : q)) return;
+  busy[s.name] = true;
+  msgs[s.name] = { text: `Asking the box to ${action === "switch" ? "switch to" : action} it…` };
+  draw();
+  try {
+    const r = await fetch(`/api/stacks/${encodeURIComponent(s.name)}/${action}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(action === "start" || action === "switch" ? { with: withs } : {}),
+    });
+    const d = await r.json().catch(() => ({}));
+    msgs[s.name] = r.ok ? null : { text: d.message || `HTTP ${r.status}`, bad: true };
+  } catch (e) {
+    msgs[s.name] = { text: `Can't reach the box (${e.message}).`, bad: true };
+  }
+  busy[s.name] = false;
+  if (logs[s.name] != null) { logs[s.name] = ""; live[s.name] = true; }
+  await tick();
+}
+
+async function fetchLog(s) {
+  try {
+    const r = await fetch(`/api/stacks/${encodeURIComponent(s.name)}/${s.action.job}/log`, { cache: "no-store" });
+    logs[s.name] = r.ok ? await r.text() : `(no log: HTTP ${r.status})`;
+  } catch (e) {
+    logs[s.name] = `(can't reach the box: ${e.message})`;
+  }
+}
+
+async function toggleLog(s) {
+  if (logs[s.name] != null) { delete logs[s.name]; draw(); return; }
+  logs[s.name] = "";
+  draw();
+  await fetchLog(s);
+  draw();
+}
+
+function draw() {
+  if (!last || !last.tree) return;
+  drawStacks(last.stacks, last.tree);
+  drawPlan(last.claude);
+  drawPeaks();
+  const t = last.tree;
+  $("host").textContent = t.name;
+  document.title = `${t.name}: ${gb(t.mem)} of ${gb(t.total)}`;
+  $("summary").textContent = `${gb(t.mem)} used of ${gb(t.total)} · ${gb(t.available)} free` +
+    (t.cpu == null ? "" : ` · CPU ${t.cpu.toFixed(1)} of ${t.cpus} cores`) +
+    (t.disk ? ` · disk ${gb(t.disk.free)} free` : "");
+  drawDisk(t.disk);
+
+  // Collapsed: what's free, and the biggest stacks.
+  const big = t.children.filter((c) => c.kind === "stack").sort((a, b) => b.mem - a.mem).slice(0, 3);
+  summary("tree", [fig(t.available < t.total * 0.1, { b: gb(t.available) }, " free"),
+    ...big.map((c) => fig(false, `${c.name} ${gb(c.mem)}`)),
+    t.cpu == null ? null : fig(false, `CPU ${t.cpu.toFixed(1)}`)]);
+
+  const bar = $("bar"), legend = $("legend");
+  bar.replaceChildren(); legend.replaceChildren();
+  let s = 0;
+  t.children.forEach((c) => {
+    const hue = colour(c, c.kind === "stack" ? s++ : 0);
+    const seg = el("span");
+    seg.style.width = (c.mem / t.total) * 100 + "%";
+    seg.style.background = hue;
+    seg.title = `${c.name}: ${gb(c.mem)}`;
+    bar.append(seg);
+    const item = el("span");
+    const sw = el("i"); sw.style.background = hue;
+    item.append(sw, document.createTextNode(`${c.name} ${gb(c.mem)}`));
+    legend.append(item);
+  });
+  bar.append(el("span", "free"));
+  const free = el("span");
+  const sw = el("i"); sw.style.background = "repeating-linear-gradient(135deg,#fff 0 2px,#bbb 2px 3px)";
+  free.append(sw, document.createTextNode(`free ${gb(t.available)}`));
+  legend.append(free);
+
+  const out = [];
+  s = 0;
+  t.children.forEach((c) => rowsOf(c, c.name, 0, colour(c, c.kind === "stack" ? s++ : 0), t.total, out));
+  $("rows").replaceChildren(...out);
+}
+
+// The root filesystem: its big users (swap file, Docker), the rest of
+// what's used, and what's free. Under 20 GB free, in red.
+function drawDisk(d) {
+  $("disk").hidden = !d;
+  if (!d) return;
+  summary("disk", [fig(d.low, { b: gb(d.free) }, ` free of ${gb(d.total)}`), ...d.users.map((u) => fig(false, `${u.name} ${gb(u.size)}`))]);
+  const bar = $("disk-bar"), legend = $("disk-legend");
+  bar.replaceChildren(); legend.replaceChildren();
+  const rest = Math.max(d.used - d.users.reduce((a, u) => a + u.size, 0), 0);
+  const parts = [...d.users.map((u, i) => [u.name, u.size, `var(--s${i % 6})`]), ["everything else", rest, "var(--other)"]];
+  for (const [name, size, hue] of parts) {
+    const seg = el("span");
+    seg.style.width = (size / d.total) * 100 + "%";
+    seg.style.background = hue;
+    seg.title = `${name}: ${gb(size)}`;
+    bar.append(seg);
+    const item = el("span");
+    const sw = el("i"); sw.style.background = hue;
+    item.append(sw, document.createTextNode(`${name} ${gb(size)}`));
+    legend.append(item);
+  }
+  bar.append(el("span", "free"));
+  const free = el("span", d.low ? "bad" : null);
+  const sw = el("i"); sw.style.background = "repeating-linear-gradient(135deg,#fff 0 2px,#bbb 2px 3px)";
+  free.append(sw, document.createTextNode(`free ${gb(d.free)}`));
+  legend.append(free);
+  $("disk-note").textContent = `${d.path}: ${gb(d.used)} used of ${gb(d.total)}.` +
+    (d.low ? " Under 20 GB free: builds, installs and Claude Code may fail. ws top on the box shows the same." : "") +
+    " Docker's size is checked every 10 minutes.";
+}
+
+function age() {
+  if (!last || !last.at) { $("age").textContent = ""; return; }
+  const a = Math.max(0, Math.round(Date.now() / 1000 - last.at));
+  // A sample is up to one interval old when fetched, and fetched every interval.
+  $("age").textContent = paused ? "paused" : a <= 2 * interval + 1 ? "live" : `updated ${a} s ago`;
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/api/tree", { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    interval = data.interval || 3;
+    if (data.tree) last = data;
+    await fetchPeaks();
+    // An open log of a start or stop that's still going follows it, to its end.
+    await Promise.all((data.stacks || [])
+      .filter((s) => logs[s.name] != null && s.action && (ACTIVE.includes(s.action.state) || live[s.name]))
+      .map((s) => { live[s.name] = ACTIVE.includes(s.action.state); return fetchLog(s); }));
+    const msg = data.error ? `The last sample failed (${data.error}); showing the one before.` : "";
+    $("banner").hidden = !msg; $("banner").textContent = msg;
+    draw();
+  } catch (e) {
+    $("banner").hidden = false;
+    $("banner").textContent = `Can't reach the box (${e.message}).` + (last ? " Showing the last sample." : "");
+  }
+  age();
+}
+
+function schedule() {
+  clearTimeout(timer);
+  if (!paused) timer = setTimeout(async () => { await tick(); schedule(); }, interval * 1000);
+}
+
+$("pause").addEventListener("click", () => {
+  paused = !paused;
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  if (!paused) tick();
+  schedule(); age();
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden && !paused) { tick(); schedule(); } });
+setInterval(age, 1000);
+document.querySelectorAll(".card").forEach((sec) => {
+  setCard(sec.id, !!cards[sec.id]);
+  sec.querySelector(".card-btn").addEventListener("click", () => {
+    cards[sec.id] = !cards[sec.id];
+    try { localStorage.setItem(CARDS, JSON.stringify(cards)); } catch (e) { /* private mode: not kept */ }
+    setCard(sec.id, cards[sec.id]);
+  });
+});
+summary("notes", [fig(false, "what the figures mean, what the buttons do")]);
+tick().then(schedule);
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+[Unit]
+Description=devbox maintenance: full upgrade, docker prune, reboot if needed (idle time only)
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/devbox-maintenance apply

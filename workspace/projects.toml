@@ -1,0 +1,135 @@
+# The workspace: what each project under ~/_ needs to become a working dev
+# environment, read by `ws` (next to this file). `ws plan NAME` prints it as
+# steps.
+#
+# This copy is an EXAMPLE: the projects below are made up, to show each
+# kind of entry. Replace them with your own; keep `dev-server` (the control
+# page is published through it).
+#
+# Per project:
+#   about     one line
+#   dir       under ~/_ (default: the name)
+#   repo      "owner/repo", cloned with its submodules; or
+#   repos     { subdir = "owner/repo", ... } for a folder of repos
+#   needs     other projects (set up first) and machine things (docker, mise)
+#   tools     toolchain versions, for mise; written to <dir>/mise.local.toml
+#   tailnet   ports to serve over HTTPS on the tailnet (tailscale serve, to
+#             127.0.0.1:<port>), only on a machine with WS_TAILNET=1 (the box)
+#   prepare   shell commands in <dir>, in order, every `ws up`: each must be
+#             safe to repeat (installs from lockfiles, make env)
+#   start     the project's own commands to run it      (ws start), as
+#             { name = "command" }: on the box (WS_SLICES=1) each one is a
+#             unit, ws-<project>-<name>.service, holding what it starts
+#   serve     { name = "command" }: a command that IS the server, in the
+#             foreground (astro dev, vite): ws start runs each as a service
+#             (on the box a unit in the stack's servers slice; on the laptop
+#             a process group, its output in ~/.local/state/ws/serve/), and
+#             ws stop stops it. For a project with no Makefile of its own.
+#   stop      the project's own commands to stop it     (ws stop); on the
+#             box ws then stops the project's servers slice
+#   verify    the project's own check that it works      (ws check)
+#   jobs      { name = "command" }: named jobs for `ws run NAME JOB`
+#   like      another project's name: a copy of it (a second checkout), with
+#             the keys given here on top; dir and tailnet aren't copied
+#             (control/manifest.py)
+#   optional.<x>  { about, run } or { about, how }: only with ws up --with x;
+#             `how` is a step ws can't take (data that isn't on GitHub).
+#             Or { about, start }: started after `start` by ws start --with x
+#
+# Construction lives here; running and verifying live in the project's repo
+# (start/verify only name its commands). See docs/ARCHITECTURE.md, "Who owns
+# what".
+
+[secrets]
+about = "your secrets (sops): the dev and test values the box may decrypt"
+repo = "YOUR-USER/secrets"
+prepare = ["make setup"]
+
+[dev-server]
+about = "this repo: the box, the tailnet, the workspace"
+repo = "YOUR-USER/dev-server"
+# The control plane (workspace/control; devbox-control.service runs it):
+# https://devbox.<tailnet>.ts.net:7070
+tailnet = [7070]
+
+# ------------------------------------------------------------ a full web stack
+#
+# A monorepo with submodules: a database in Docker, API workers, an Angular
+# app. Its own Makefile knows how to start and stop each part in the
+# background; ws only names those commands.
+
+[shop]
+about = "Shop: the monorepo and its submodules (stack A)"
+repo = "YOUR-ORG/shop"
+needs = ["secrets", "docker"]
+# Use CI's versions where CI has them.
+tools = { node = "24", supabase = "2.111.0" }
+prepare = [
+  # .env files from the secrets repo: the box gets dev and test only. First,
+  # because an install hook may read them.
+  "make env",
+  # Only where the lockfile is newer than the last install (npm ci writes
+  # node_modules/.package-lock.json last): npm ci empties node_modules, and
+  # under a running server that kills it.
+  "for d in shop-app shop-api; do if [ $d/node_modules/.package-lock.json -nt $d/package-lock.json ]; then echo \"$d: dependencies up to date\"; else (cd $d && npm ci --no-audit --no-fund); fi; done",
+]
+# Every port the browser talks to: the app, the API, Supabase and its Studio.
+tailnet = [4200, 8787, 54321, 54323]
+start = { db = "make dev-up", api = "make api-restart" }
+# Everything start (and --with app) started, the containers too: what frees
+# the memory for another stack.
+stop = ["make app-kill", "make api-kill", "make dev-down"]
+verify = "bash scripts/health-check.sh"
+jobs = { build = "cd shop-app && npx ng build --configuration=production", test = "make test" }
+
+[shop.optional.app]
+about = "the Angular app, in the background: https://devbox.<tailnet>.ts.net:4200"
+start = "make app-restart"
+
+[shop.optional.assets]
+about = "big files that aren't on GitHub (seed media)"
+how = "from the laptop: rsync -a ~/_/shop-assets/ devbox:_/shop-assets/"
+
+# Stack B: a second checkout, ~/_/shop-b, so two agents can work on two
+# branches at once. Its Makefile sees the -b and takes ports +20.
+[shop-b]
+like = "shop"
+about = "Shop: a second checkout (stack B), ports +20"
+tailnet = [4220, 8807, 54341, 54343]
+
+# ---------------------------------------------------------- a site, no Makefile
+#
+# `serve` runs a foreground dev server as the stack's service. Vite answers
+# only hosts it knows: the tailnet's name is added.
+
+[blog]
+about = "the blog, an Astro site: https://devbox.<tailnet>.ts.net:4321"
+repo = "YOUR-USER/blog"
+tools = { node = "24" }
+prepare = [
+  "if [ node_modules/.package-lock.json -nt package-lock.json ]; then echo 'dependencies up to date'; else npm ci --no-audit --no-fund; fi",
+]
+tailnet = [4321]
+serve = { dev = "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=.ts.net exec ./node_modules/.bin/astro dev --host \"${DEV_BIND_HOST:-127.0.0.1}\" --port 4321" }
+verify = "npm run check"
+
+# ---------------------------------------------------------- a folder of repos
+#
+# A folder that isn't a repo itself, only holds some: `repos` alone (no
+# `repo`), so ws makes the folder and clones each repo into it. A repo in it
+# that builds or runs is a project of its own: dir = "<folder>/<repo>",
+# needs = [the folder].
+
+[tools]
+about = "small projects, each its own repo"
+repos = { scripts = "YOUR-USER/scripts", ml = "YOUR-USER/ml-experiments" }
+
+[tools-ml]
+about = "a Python project (uv)"
+dir = "tools/ml"
+needs = ["tools"]
+tools = { python = "3.12", uv = "0.13" }
+
+[tools-ml.optional.env]
+about = "its Python environment: PyTorch, several GB (uv sync)"
+run = "uv sync"

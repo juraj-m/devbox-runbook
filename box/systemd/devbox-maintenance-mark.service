@@ -1,0 +1,6 @@
+[Unit]
+Description=Mark devbox maintenance as due
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/devbox-maintenance mark

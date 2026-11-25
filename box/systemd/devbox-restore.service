@@ -1,0 +1,28 @@
+# After a boot, the stacks as they were before it (workspace/ws: ws
+# restore). A reboot, the weekly maintenance's or a crash, ends every
+# stack, the paused ones too. ws keeps what each should be (every start,
+# stop, pause and resume records it); this brings them back one at a time:
+# each that was paused is started, left to settle, and paused again, then
+# the one that was running is started. Each step is a job of the stack, so
+# the control page shows it going; this unit's journal has the whole run.
+#
+# A system unit, as the dev user: like devbox-control it reaches that
+# user's own systemd (lingering, so it's up at boot) for the stacks' units.
+# zsh reads ~/.zshenv: PATH (ws, mise), WS_SLICES. Not a oneshot: the
+# restore takes a while (a big web stack's cold start was ~12 min), and the
+# boot doesn't wait for it.
+# @PLACEHOLDERS@ are filled from devbox.conf by bootstrap.sh.
+[Unit]
+Description=devbox: the stacks back as they were before the boot (ws restore)
+After=network-online.target docker.service user@@DEV_UID@.service devbox-control.service
+Wants=network-online.target docker.service user@@DEV_UID@.service
+
+[Service]
+Type=simple
+User=@DEV_USER@
+Group=@DEV_USER@
+Environment=XDG_RUNTIME_DIR=/run/user/@DEV_UID@ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@DEV_UID@/bus
+ExecStart=/usr/bin/zsh -c 'exec ws restore'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+#!/bin/sh
+# gh, with GH_TOKEN set to the token for the repo (or owner) the command is
+# about (see devbox-github). An explicit GH_TOKEN wins.
+if [ -z "${GH_TOKEN:-}" ] && target=$(devbox-github target "$@") &&
+	t=$(devbox-github token "$target"); then
+	GH_TOKEN=$t
+	export GH_TOKEN
+fi
+exec /usr/bin/gh "$@"

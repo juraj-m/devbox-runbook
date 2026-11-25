@@ -1,0 +1,12 @@
+[Unit]
+Description=Outbound allowlist: load the lists and the mode (devbox-egress)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/devbox-egress apply
+
+[Install]
+WantedBy=multi-user.target

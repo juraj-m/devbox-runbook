@@ -1,0 +1,16 @@
+[Unit]
+Description=Block public access to Docker-published ports (tailnet and localhost only)
+After=docker.service
+Requires=docker.service
+# Docker keeps DOCKER-USER's rules across its own restarts; rerun anyway when
+# docker is (re)started, it is idempotent.
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/devbox-docker-guard start
+ExecStop=/usr/local/sbin/devbox-docker-guard stop
+
+[Install]
+WantedBy=docker.service

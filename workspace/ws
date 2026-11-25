@@ -1,0 +1,1579 @@
+#!/usr/bin/env python3
+"""ws: build a project's dev environment, the same way every time.
+
+  ws list                      the projects in projects.toml
+  ws plan NAME [--with X]      every step `ws up` takes for NAME, in order, and
+                               which are done already. Changes nothing.
+  ws up NAME [--with X]        take them. Each step is safe to repeat.
+  ws start NAME [--with X]     the project's own start commands (and X's)
+  ws stop NAME                 its stop commands; on the box, then its servers
+  ws pause NAME                (the box) its servers frozen, its containers
+                               paused, its memory out to swap: the room for
+                               another stack, and back in seconds
+  ws resume NAME               the other way
+  ws switch NAME [--with X]    (the box) every other running stack paused,
+                               then NAME resumed (or started)
+  ws remember                  (the box) record what each stack is now, where
+                               nothing is recorded yet (make update does it)
+  ws restore                   (the box, after a boot: devbox-restore.service)
+                               the stacks as they were, one at a time: each
+                               that was paused started, left to settle, and
+                               paused; the one that was running started last
+  ws check NAME               the project's own verification
+  ws session NAME [LABEL]      a tmux session in the project (on the box: the
+                               stack's own tmux, so what runs there counts as
+                               the stack's)
+  ws claude NAME               a Claude Code session in the stack, with Remote
+                               Control (claude.ai/code, the Claude app): in
+                               the stack's tmux, a tmux session of its own
+                               (claude-1, claude-2...), so several run at once
+  ws claudes [NAME]            the sessions ws claude started: what each is
+                               doing (working, needs input, finished, ended),
+                               its link, how to attach to it
+  ws claude-trust NAME SESSION yes to its "trust this folder?" (the first
+                               session in a folder asks)
+  ws claude-end NAME SESSION   end one (claude-2)
+  ws top [--json]              the box's memory and CPU as a tree: base
+                               system, Docker, each stack (control/boxtree.py)
+  ws peaks [DAYS] [--json]     (the box) each stack's memory idle and at its
+                               peaks, Claude sessions' and jobs', over the last
+                               DAYS (7); and what runs now could take more at
+                               its peaks, so what's left for more
+                               (control/watch.py, recorded by devbox-control)
+  ws run NAME JOB [--wait] [--parallel] [-- COMMAND...]
+                               a job (a build, a test run) in the background,
+                               in the project's folder, apart from whoever
+                               started it: a Claude session's timeout or exit
+                               doesn't end it. COMMAND, or the project's
+                               jobs.JOB from the manifest. One at a time per
+                               project unless --parallel; --wait follows its
+                               output and exits with its code.
+  ws jobs [NAME]               jobs and how they ended
+  ws logs NAME JOB [-f]        a job's output (-f: follow it until it ends)
+  ws cancel NAME JOB
+  ws statusline                Claude Code's statusLine command: records the
+                               session's snapshot (the plan's 5-hour and
+                               weekly limits, its cost) under
+                               ~/.local/state/ws/claude, prints the line
+                               (control/claude_usage.py)
+
+What a project needs is in projects.toml, next to this file (WS_MANIFEST
+overrides). The split (docs/ARCHITECTURE.md, "Who owns what"): dev-server
+*constructs* (clone, toolchain, dependencies, env files); how to run and how
+to verify a project live in the project's repo, and the manifest only
+names those commands.
+
+Projects live under ~/_ (WS_ROOT overrides), as on the Mac.
+
+Where WS_SLICES=1 (bootstrap sets it on the box), everything a stack runs
+lives in its own systemd slice, so its memory and CPU are measured as a
+whole and it stops as a whole:
+
+  ws.slice
+    ws-NAME.slice
+      ws-NAME-servers.slice    ws-NAME-KEY.service per start command
+      ws-NAME-sessions.slice   ws-NAME-tmux.scope: ws session's tmux
+      ws-NAME-jobs.slice       ws-NAME-job-JOB.service per ws run, capped
+                               at WS_JOB_MEMORY_MAX (6G)
+
+A job's state and output are files, the same on the Mac and the box:
+~/.local/state/ws/jobs/NAME/JOB/{meta.json,log} (WS_STATE overrides).
+"""
+import fcntl
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+try:
+    import tomllib
+except ImportError:
+    sys.exit("ws needs Python 3.11+ (tomllib); this is " + sys.version.split()[0])
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "control"))
+import manifest  # noqa: E402  (projects.toml, `like` resolved)
+
+MANIFEST = os.environ.get("WS_MANIFEST", os.path.join(HERE, "projects.toml"))
+ROOT = os.environ.get("WS_ROOT", os.path.expanduser("~/_"))
+MISE_FILE = "mise.local.toml"
+
+# What a machine must have, checked, never installed here: that's box/bootstrap.sh
+# (or Homebrew on the Mac).
+MACHINE = {
+    "docker": ("docker info", "Docker, usable without sudo (box: bootstrap.sh)"),
+    "mise": ("mise --version", "mise (box: bootstrap.sh; Mac: brew install mise)"),
+    "caddy": ("caddy version", "Caddy, for tailnet ports (box: bootstrap.sh)"),
+}
+
+
+class Fail(Exception):
+    pass
+
+
+def load():
+    try:
+        return manifest.load(MANIFEST)
+    except manifest.ManifestError as e:
+        raise Fail(f"{MANIFEST}: {e}")
+
+
+def sh(cmd, cwd=None, quiet=False):
+    r = subprocess.run(["bash", "-c", cmd], cwd=cwd,
+                       stdout=subprocess.DEVNULL if quiet else None,
+                       stderr=subprocess.DEVNULL if quiet else None)
+    return r.returncode == 0
+
+
+def git(*args, cwd=None):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def commands(value):
+    """prepare / stop: a list of commands, or one command as a string."""
+    return [value] if isinstance(value, str) else list(value)
+
+
+def named(value):
+    """start: {name = command} (on the box, one unit each), a list, or one
+    command as a string. Returns [(name, command)]."""
+    if isinstance(value, dict):
+        return list(value.items())
+    return [(str(i), c) for i, c in enumerate(commands(value), 1)]
+
+
+def esc(name):
+    """A name as systemd-escape writes it: anything but [A-Za-z0-9:_.] as
+    \\xNN. A dash must be escaped: in a slice name it means "child of"."""
+    out = "".join(c if (c.isascii() and c.isalnum()) or c in ":_." else "\\x%02x" % ord(c)
+                  for c in name)
+    return "\\x2e" + out[1:] if out.startswith(".") else out
+
+
+def slices():
+    return os.environ.get("WS_SLICES") == "1"
+
+
+# A unit gets the caller's environment, by name: systemd-run --setenv=NAME
+# takes the value from its own environment, so values stay off the command
+# line. Not the login's own variables, which would be stale in a unit.
+LOGIN_ONLY = {"PWD", "OLDPWD", "SHLVL", "_", "TERM", "TMUX", "TMUX_PANE", "MAIL",
+              "XDG_SESSION_ID", "XDG_SESSION_TYPE", "XDG_SESSION_CLASS",
+              # What systemd set for the unit ws itself runs in (a ws start
+              # from the control plane runs as a job): each unit gets its own.
+              "INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "NOTIFY_SOCKET",
+              "MANAGERPID", "MEMORY_PRESSURE_WATCH", "MEMORY_PRESSURE_WRITE"}
+
+
+def unit_env():
+    return sorted(k for k in os.environ
+                  if k not in LOGIN_ONLY and not k.startswith("SSH_") and k.isidentifier())
+
+
+class Project:
+    def __init__(self, projects, name):
+        if name not in projects:
+            raise Fail(f"no project {name!r} in {MANIFEST} (ws list)")
+        self.name, p = name, projects[name]
+        self.about = p.get("about", "")
+        self.dir = os.path.join(ROOT, p.get("dir", name))
+        # One repo; a folder of repos ({subdir = "owner/repo"}); or both: a
+        # root repo with the workspace files (Makefile, environment.yml,
+        # CLAUDE.md) and its repos inside it, which the root's .gitignore
+        # leaves out. The root is cloned first, into the empty folder.
+        self.repos = {"": p["repo"]} if "repo" in p else {}
+        self.repos.update(p.get("repos", {}))
+        self.needs = list(p.get("needs", []))
+        self.tools = dict(p.get("tools", {}))
+        if self.tools and "mise" not in self.needs:
+            self.needs.append("mise")
+        self.tailnet = [int(x) for x in p.get("tailnet", [])]
+        if self.tailnet and os.environ.get("WS_TAILNET") == "1" and "caddy" not in self.needs:
+            self.needs.append("caddy")
+        self.prepare = commands(p.get("prepare", []))
+        self.start = named(p.get("start", []))
+        # serve: long-running commands in the foreground (a dev server), run
+        # by ws as services: no Makefile needed to put them in the background.
+        self.serve = named(p.get("serve", {}))
+        clash = {k for k, _ in self.start} & {k for k, _ in self.serve}
+        if clash:
+            raise Fail(f"{name}: {', '.join(sorted(clash))} in both start and serve: one unit each, so one name each")
+        self.runs = bool(self.start or self.serve)
+        self.stop = commands(p.get("stop", []))
+        self.jobs = dict(p.get("jobs", {}))
+        self.verify = p.get("verify")
+        self.optional = dict(p.get("optional", {}))
+        for n in self.needs:
+            if n not in MACHINE and n not in projects:
+                raise Fail(f"{name} needs {n!r}: neither a project nor one of {', '.join(MACHINE)}")
+
+    def where(self, sub=""):
+        return os.path.join(self.dir, sub) if sub else self.dir
+
+    def short(self, path):
+        home = os.path.expanduser("~")
+        return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+    def mise_toml(self):
+        lines = [f"# Written by ws from dev-server workspace/projects.toml [{self.name}].",
+                 "# Not committed (in .git/info/exclude); edit the manifest, then ws up.",
+                 "[tools]"]
+        lines += [f'{k} = "{v}"' for k, v in self.tools.items()]
+        return "\n".join(lines) + "\n"
+
+    # Each step: (label, description, done?, action). done is None when a
+    # step always runs (prepare commands, which must be safe to repeat).
+    def steps(self, extras):
+        out = []
+        for sub, repo in self.repos.items():
+            path = self.where(sub)
+            out.append(("clone", f"{repo} into {self.short(path)}, with submodules",
+                        os.path.isdir(os.path.join(path, ".git")) and not self.missing_submodules(path),
+                        lambda path=path, repo=repo: self.clone(path, repo)))
+        if self.tools:
+            want = self.mise_toml()
+            f = os.path.join(self.dir, MISE_FILE)
+            have = open(f).read() if os.path.exists(f) else None
+            out.append(("tools", ", ".join(f"{k} {v}" for k, v in self.tools.items()) + " (mise)",
+                        have == want, self.install_tools))
+        if self.tailnet and os.environ.get("WS_TAILNET") == "1":
+            host, status = box_host(), serve_status()
+            want, f = self.caddy_site(), caddy_site_file(self.name)
+            have = open(f).read() if os.path.exists(f) else None
+            out.append(("proxy", f"caddy: compress ports {', '.join(map(str, self.tailnet))} "
+                        f"({PROXY_ADDR}:<port + {PROXY_OFFSET}> to 127.0.0.1:<port>)",
+                        have == want, self.write_caddy_site))
+        for port in self.tailnet:
+            if os.environ.get("WS_TAILNET") != "1":
+                out.append(("tailnet", f"{port}: not on this machine (WS_TAILNET=1 opts in)", "skip", None))
+            else:
+                out.append(("tailnet", f"https://{host}:{port} to caddy ({PROXY_ADDR}:{proxy_port(port)})",
+                            served_https(port, status, host), lambda port=port: publish(port)))
+        for cmd in self.prepare:
+            out.append(("prepare", cmd, None, lambda cmd=cmd: self.run(cmd)))
+        for x in extras:
+            o = self.optional[x]
+            if "run" in o:
+                out.append((x, o["run"], None, lambda cmd=o["run"]: self.run(cmd)))
+        return out
+
+    def missing_submodules(self, path):
+        if not os.path.exists(os.path.join(path, ".gitmodules")):
+            return []
+        status = git("submodule", "status", cwd=path) or ""
+        return [l.split()[1] for l in status.splitlines() if l.startswith("-")]
+
+    def clone(self, path, repo):
+        if not os.path.isdir(os.path.join(path, ".git")):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # The Mac's form; the box rewrites it to HTTPS (bootstrap.sh).
+            if subprocess.run(["git", "clone", "-q", f"git@github.com:{repo}.git", path]).returncode:
+                raise Fail(f"git clone {repo} failed")
+        # Only submodules not checked out yet: one that is may hold work, on
+        # another commit than the one recorded, and stays as it is.
+        missing = self.missing_submodules(path)
+        if missing and subprocess.run(["git", "-C", path, "submodule", "update", "-q", "--init",
+                                       "--recursive", "--", *missing]).returncode:
+            raise Fail(f"submodules of {repo} failed")
+
+    def caddy_site(self):
+        lines = [f"# Written by ws from dev-server workspace/projects.toml [{self.name}].",
+                 "# Edit the manifest, then ws up."]
+        for port in self.tailnet:
+            lines += [f"http://:{proxy_port(port)} {{",
+                      f"\tbind {PROXY_ADDR}",
+                      "\tencode zstd gzip",
+                      f"\treverse_proxy 127.0.0.1:{port} {{",
+                      # Stream as it comes (server-sent events, live reload).
+                      "\t\tflush_interval -1",
+                      "\t}",
+                      "}"]
+        return "\n".join(lines) + "\n"
+
+    def write_caddy_site(self):
+        f = caddy_site_file(self.name)
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f + ".new", "w") as fh:
+            fh.write(self.caddy_site())
+        os.replace(f + ".new", f)
+        cfg = os.path.join(CADDY_DIR, "Caddyfile")
+        if subprocess.run(["caddy", "reload", "--config", cfg, "--adapter", "caddyfile"]).returncode:
+            raise Fail(f"caddy reload failed: is devbox-caddy running? (systemctl status devbox-caddy)")
+
+    def install_tools(self):
+        f = os.path.join(self.dir, MISE_FILE)
+        with open(f, "w") as fh:
+            fh.write(self.mise_toml())
+        exclude = git("rev-parse", "--git-path", "info/exclude", cwd=self.dir)
+        if exclude:
+            exclude = os.path.join(self.dir, exclude.strip())
+            have = open(exclude).read().splitlines() if os.path.exists(exclude) else []
+            if MISE_FILE not in have:
+                os.makedirs(os.path.dirname(exclude), exist_ok=True)
+                with open(exclude, "a") as fh:
+                    fh.write(f"{MISE_FILE}\n")
+        for cmd in (["mise", "trust", "-q", f], ["mise", "install"]):
+            if subprocess.run(cmd, cwd=self.dir).returncode:
+                raise Fail(" ".join(cmd) + " failed")
+
+    def argv(self, cmd):
+        # Strict mode set inside, not as flags: bash reads startup files
+        # first (/etc/bash.bashrc over SSH), and those aren't -u clean.
+        argv = ["bash", "-c", "set -euo pipefail\n" + cmd]
+        return ["mise", "exec", "--", *argv] if self.tools else argv
+
+    def run(self, cmd):
+        if subprocess.run(self.argv(cmd), cwd=self.dir).returncode:
+            raise Fail(f"{self.name}: failed: {cmd}")
+
+    # The box: ws-NAME.slice, with its servers and sessions slices.
+    def slice(self, part=""):
+        return f"ws-{esc(self.name)}{'-' + part if part else ''}.slice"
+
+    def unit(self, key):
+        return f"ws-{esc(self.name)}-{esc(key)}.service"
+
+    def job_unit(self, job):
+        return f"ws-{esc(self.name)}-job-{esc(job)}.service"
+
+    def run_unit(self, key, cmd):
+        """cmd as a oneshot unit in the servers slice. The unit stays active
+        after cmd exits and holds whatever cmd started in the background:
+        those processes are the unit's, measured with it, stopped with it.
+        A start first stops what the last one left (the start commands are
+        restarts anyway)."""
+        unit = self.unit(key)
+        subprocess.run(["systemctl", "--user", "stop", unit], stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "--user", "reset-failed", unit],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # The unit's output goes to the journal: follow it there meanwhile.
+        r = subprocess.run(["journalctl", "--user", "-n0", "--show-cursor"],
+                           capture_output=True, text=True)
+        cursor = next((l.split(": ", 1)[1] for l in r.stdout.splitlines()
+                       if l.startswith("-- cursor: ")), None)
+        follow = subprocess.Popen(["journalctl", "--user", "-u", unit, "-f", "-o", "cat",
+                                   *(["--after-cursor", cursor] if cursor else ["-n0"])])
+        try:
+            rc = subprocess.run(["systemd-run", "--user", "--quiet", f"--unit={unit}",
+                                 f"--slice={self.slice('servers')}",
+                                 f"--description={self.name} {key}: {cmd}",
+                                 "-p", "Type=oneshot", "-p", "RemainAfterExit=yes",
+                                 "-p", "TimeoutStartSec=20min",
+                                 f"--working-directory={self.dir}",
+                                 *(f"--setenv={k}" for k in unit_env()),
+                                 "--", *self.argv(cmd)]).returncode
+        finally:
+            # The journal can be a moment behind the unit.
+            try:
+                follow.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                follow.terminate()
+                follow.wait()
+        if rc:
+            raise Fail(f"{self.name}: failed: {cmd}\n    its output: journalctl --user -u {unit}")
+
+
+    # serve: the command is the server, in the foreground.
+    def run_service(self, key, cmd):
+        """(The box) cmd as a service in the servers slice: the unit is the
+        server, its output in the journal. Restarted if it runs already."""
+        unit = self.unit(key)
+        subprocess.run(["systemctl", "--user", "stop", unit], stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "--user", "reset-failed", unit],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if subprocess.run(["systemd-run", "--user", "--quiet", f"--unit={unit}",
+                           f"--slice={self.slice('servers')}",
+                           f"--description={self.name} {key}: {cmd}",
+                           f"--working-directory={self.dir}",
+                           *(f"--setenv={k}" for k in unit_env()),
+                           "--", *self.argv(cmd)]).returncode:
+            raise Fail(f"{self.name}: systemd-run for {key} failed")
+        time.sleep(SERVE_CHECK)
+        if subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit]).returncode:
+            raise Fail(f"{self.name}: {key} exited at once: {cmd}\n    its output: journalctl --user -u {unit}")
+        print(f"==> {self.name}: {key} running; its output: journalctl --user -u {unit} -f", flush=True)
+
+    def serve_files(self, key):
+        d = os.path.join(STATE, "serve", self.name)
+        return d, os.path.join(d, f"{key}.pid"), os.path.join(d, f"{key}.log")
+
+    def run_detached(self, key, cmd):
+        """(The Mac) cmd in a process group of its own, its output to a
+        log, its pid kept for ws stop. Restarted if it runs already."""
+        self.stop_detached(key)
+        d, pid_file, log_file = self.serve_files(key)
+        os.makedirs(d, exist_ok=True)
+        with open(log_file, "w") as log:
+            proc = subprocess.Popen(self.argv(cmd), cwd=self.dir, start_new_session=True,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        with open(pid_file, "w") as f:
+            f.write(f"{proc.pid}\n")
+        time.sleep(SERVE_CHECK)
+        if proc.poll() is not None:
+            os.remove(pid_file)
+            raise Fail(f"{self.name}: {key} exited at once (exit {proc.returncode}): {cmd}\n    its output: {log_file}")
+        print(f"==> {self.name}: {key} running (pid {proc.pid}); its output: {log_file}", flush=True)
+
+    def stop_detached(self, key):
+        """Stop what run_detached started (its whole process group): True
+        if something was running."""
+        _, pid_file, _ = self.serve_files(key)
+        try:
+            with open(pid_file) as f:
+                pid = int(f.read().strip())
+        except (OSError, ValueError):
+            return False
+        os.remove(pid_file)
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return False
+        for _ in range(100):
+            time.sleep(0.1)
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return True
+        os.killpg(pid, signal.SIGKILL)
+        return True
+
+
+# How long a served command must keep running for its start to count.
+SERVE_CHECK = float(os.environ.get("WS_SERVE_CHECK", "2"))
+# How long a served project's tailnet ports may take to answer.
+SERVE_WAIT = float(os.environ.get("WS_SERVE_WAIT", "300"))
+
+
+def wait_listening(ports, timeout=None):
+    """Until something answers on each of 127.0.0.1's ports, or timeout:
+    then say which don't (they're served on the tailnet anyway)."""
+    import socket
+    timeout = SERVE_WAIT if timeout is None else timeout
+    end, left = time.monotonic() + timeout, list(ports)
+    while left:
+        for port in list(left):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                left.remove(port)
+            except OSError:
+                pass
+        if not left or time.monotonic() > end:
+            break
+        time.sleep(0.5)
+    for port in left:
+        print(f"ws: {port} isn't answering after {timeout:.0f} s; served on the tailnet anyway", flush=True)
+
+
+# Tailnet ports: a stack on the box, used from the tablet or phone. Every
+# port is served over HTTPS by Tailscale, with the tailnet's certificate, at
+# https://<box>.<tailnet>.ts.net:<port>, to 127.0.0.1:<port>: over plain http
+# a page has no secure context (no navigator.locks, crypto.subtle), and
+# Supabase auth breaks. See docs/PROJECT-CHECKLIST.md. Opt-in per machine (bootstrap sets
+# WS_TAILNET=1 on the box): only the box gets a certificate; the Mac's stacks
+# stay private.
+def serve_status():
+    r = subprocess.run(["tailscale", "serve", "status", "--json"], capture_output=True, text=True)
+    try:
+        return (json.loads(r.stdout or "{}") or {}) if r.returncode == 0 else {}
+    except ValueError:
+        return {}
+
+
+def box_host():
+    r = subprocess.run(["tailscale", "status", "--self", "--json"], capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout)["Self"]["DNSName"].rstrip(".")
+    except (ValueError, KeyError, TypeError):
+        raise Fail("can't read this machine's tailnet name (tailscale status)")
+
+
+# Between Tailscale and the project's server sits Caddy, which compresses:
+# Angular's dev server sends main.js as 9 MB uncompressed (1.9 MB gzipped),
+# and over the tailnet that was most of a 12 s page load on the tablet. Caddy
+# listens on 127.0.0.2 at the port + PROXY_OFFSET: not the port itself,
+# because a server may hold its port on every address (the Supabase CLI's
+# containers publish 0.0.0.0). Tailscale still serves the project's own port
+# number, so URLs don't change. bootstrap.sh installs Caddy and its base
+# Caddyfile, which imports sites/*.caddy; ws writes one site file per project.
+PROXY_ADDR = "127.0.0.2"
+PROXY_OFFSET = 10000
+CADDY_DIR = os.environ.get("WS_CADDY_DIR", os.path.expanduser("~/.config/devbox/caddy"))
+
+
+def proxy_port(port):
+    if port + PROXY_OFFSET > 65535:
+        raise Fail(f"tailnet port {port}: Caddy listens on port + {PROXY_OFFSET}, "
+                   f"and {port + PROXY_OFFSET} is past 65535; use a lower port")
+    return port + PROXY_OFFSET
+
+
+def caddy_site_file(project):
+    return os.path.join(CADDY_DIR, "sites", f"{project}.caddy")
+
+
+def served_https(port, status, host):
+    """Whether port is already served as HTTPS to its Caddy site."""
+    if not (status.get("TCP") or {}).get(str(port), {}).get("HTTPS"):
+        return False
+    web = (status.get("Web") or {}).get(f"{host}:{port}") or {}
+    return ((web.get("Handlers") or {}).get("/") or {}).get("Proxy") == f"http://{PROXY_ADDR}:{proxy_port(port)}"
+
+
+def publish(port):
+    # A plain TCP forward on the port (the first version of this) must go
+    # before the port can be HTTPS.
+    if (serve_status().get("TCP") or {}).get(str(port), {}).get("TCPForward"):
+        subprocess.run(["tailscale", "serve", f"--tcp={port}", "off"], check=False)
+    if subprocess.run(["tailscale", "serve", "--bg", f"--https={port}",
+                       f"http://{PROXY_ADDR}:{proxy_port(port)}"]).returncode:
+        raise Fail(f"tailscale serve for port {port} failed (operator? HTTPS certificates? box: bootstrap.sh)")
+
+
+def check_extras(p, extras):
+    for x in extras:
+        if x not in p.optional:
+            raise Fail(f"{p.name} has no optional {x!r}" +
+                       (f" (has: {', '.join(p.optional)})" if p.optional else ""))
+
+
+def plan(projects, name, extras, seen=None):
+    seen = set() if seen is None else seen
+    if name in seen:
+        return
+    seen.add(name)
+    p = Project(projects, name)
+    check_extras(p, extras)
+    for n in p.needs:
+        if n in projects:
+            plan(projects, n, [], seen)
+    print(f"{name}: {p.about}" if p.about else name)
+    for n in p.needs:
+        if n in MACHINE:
+            ok = sh(MACHINE[n][0], quiet=True)
+            print(f"  needs    {n:10} {'ok' if ok else 'MISSING: ' + MACHINE[n][1]}")
+        else:
+            print(f"  needs    {n:10} (project, above)")
+    for i, (label, desc, done, _) in enumerate(p.steps(extras), 1):
+        mark = {True: "  [done]", False: "", None: "  [runs every time]", "skip": ""}[done]
+        print(f"  {i:2} {label:8} {desc}{mark}")
+    if p.runs or p.verify:
+        print("  then, the project's own:")
+        if p.start:
+            print(f"     start    {'; '.join(c for _, c in p.start)}   (ws start {name})")
+        for key, c in p.serve:
+            print(f"     serve    {key}: {c}   (ws start {name})")
+        if p.stop:
+            print(f"     stop     {'; '.join(p.stop)}   (ws stop {name})")
+        if p.verify:
+            print(f"     verify   {p.verify}   (ws check {name})")
+    for x, o in p.optional.items():
+        if "start" in o:
+            print(f"  optional {x}: {o.get('about', '')}\n     start: {o['start']}   (ws start {name} --with {x})")
+            continue
+        how = f"runs: {o['run']}" if "run" in o else f"by hand: {o.get('how', '?')}"
+        on = "  [included]" if x in extras else f"  (--with {x})"
+        print(f"  optional {x}: {o.get('about', '')}{on}\n     {how}")
+
+
+def up(projects, name, extras, seen=None):
+    seen = set() if seen is None else seen
+    if name in seen:
+        return
+    seen.add(name)
+    p = Project(projects, name)
+    check_extras(p, extras)
+    # Everything checked before anything changes.
+    missing = [n for n in p.needs if n in MACHINE and not sh(MACHINE[n][0], quiet=True)]
+    if missing:
+        raise Fail(f"{name}: this machine lacks " + "; ".join(MACHINE[n][1] for n in missing))
+    for n in p.needs:
+        if n in projects:
+            up(projects, n, [], seen)
+    print(f"==> {name}")
+    for i, (label, desc, done, action) in enumerate(p.steps(extras), 1):
+        if done == "skip":
+            print(f"  {i:2} {label:8} {desc}")
+            continue
+        if done:
+            print(f"  {i:2} {label:8} {desc}: done")
+            continue
+        print(f"  {i:2} {label:8} {desc}", flush=True)
+        action()
+    for x in extras:
+        o = p.optional[x]
+        if "run" not in o and "start" not in o:
+            print(f"  {x}: not automated. By hand: {o.get('how', '?')}")
+    if p.runs:
+        print(f"  ready. Start it: ws start {name}")
+
+
+def own(projects, name, which, extras=()):
+    p = Project(projects, name)
+    check_extras(p, extras)
+    cmds = list(p.start) if which == "start" else [("verify", p.verify)] if p.verify else []
+    if which == "start":
+        for x in extras:
+            if "start" not in p.optional[x]:
+                raise Fail(f"{name}'s optional {x} has nothing to start (ws up --with {x})")
+            cmds.append((x, p.optional[x]["start"]))
+    if not cmds and not (which == "start" and p.serve):
+        raise Fail(f"{name} has no {which} command in {MANIFEST}")
+    if not os.path.isdir(p.dir):
+        raise Fail(f"no {p.short(p.dir)}: ws up {name} first")
+    # Tailscale holds a served port on the tailnet address, and a server that
+    # then asks for the port on every address (the Supabase CLI's containers
+    # publish 0.0.0.0) fails with "address already in use". So the project's
+    # tailnet ports are off while its start commands run, and served again
+    # after, also when one fails. Served after, the port works for other
+    # devices (Tailscale takes their connections in its own network stack);
+    # only the box's connections to its own tailnet name fail, as Tailscale's
+    # local listener can't bind next to 0.0.0.0 (on the box: 127.0.0.1).
+    lock = stack_lock(name) if which == "start" else None  # noqa: F841 (held until we return)
+    if which == "start" and slices():
+        # A start restarts every command's unit: stopping a frozen one
+        # waits on servers that can't act, and a paused container on Docker.
+        thaw(projects, p, quiet_if_not_paused=True)
+    held =p.tailnet if which == "start" and os.environ.get("WS_TAILNET") == "1" else []
+    for port in held:
+        subprocess.run(["tailscale", "serve", f"--https={port}", "off"], capture_output=True)
+    try:
+        for key, c in cmds:
+            if which == "start" and slices():
+                print(f"==> {name}: {key} ({p.unit(key)}): {c}", flush=True)
+                p.run_unit(key, c)
+            else:
+                print(f"==> {name}: {c}", flush=True)
+                p.run(c)
+        for key, c in p.serve if which == "start" else ():
+            if slices():
+                print(f"==> {name}: serve {key} ({p.unit(key)}): {c}", flush=True)
+                p.run_service(key, c)
+            else:
+                print(f"==> {name}: serve {key}: {c}", flush=True)
+                p.run_detached(key, c)
+        # A served command returns before its server binds (astro dev takes
+        # seconds): the ports stay off until they answer, as for a start.
+        if held and p.serve and which == "start":
+            wait_listening(held)
+    finally:
+        for port in held:
+            publish(port)
+    if which == "start":
+        want(name, "running", extras)
+
+
+def stack_lock(name):
+    """A start, stop, pause or resume holds the project's lock until it returns: one under
+    the other leaves half a stack (a stop during a start stops what's up so
+    far, and the start goes on). The second one isn't queued: it says so,
+    since whoever asked meant the state before the first."""
+    d = os.path.join(STATE, "locks")
+    os.makedirs(d, exist_ok=True)
+    f = open(os.path.join(d, f"{name}.lock"), "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        raise Fail(f"{name}: a start, stop, pause or resume of it is running already")
+    return f
+
+
+def stop(projects, name):
+    p = Project(projects, name)
+    if not p.stop and not p.serve and not slices():
+        raise Fail(f"{name} has no stop command in {MANIFEST}")
+    lock = stack_lock(name)  # noqa: F841 (held until we return)
+    if slices():
+        # A frozen server can't act on its stop signal, and Docker won't
+        # stop a paused container.
+        thaw(projects, p, quiet_if_not_paused=True)
+    # The project's own first: they stop what isn't in the slice (its
+    # containers), and stop servers more gently than the slice's SIGTERM.
+    for c in p.stop:
+        print(f"==> {name}: {c}", flush=True)
+        p.run(c)
+    if not slices():
+        for key, _ in p.serve:
+            if p.stop_detached(key):
+                print(f"==> {name}: stopped {key}", flush=True)
+    if slices():
+        print(f"==> {name}: stop {p.slice('servers')}", flush=True)
+        if subprocess.run(["systemctl", "--user", "stop", p.slice("servers")]).returncode:
+            raise Fail(f"systemctl --user stop {p.slice('servers')} failed")
+    want(name, "stopped")
+
+
+# Pausing (the box only): a stack's servers frozen and its containers paused,
+# its memory pushed out to swap, so another stack has the room. Resuming
+# takes seconds where a cold start takes minutes (a big web stack: ~20 s
+# against ~12 min, docs/ARCHITECTURE.md). Only the servers: the stack's sessions and
+# jobs go on (a Claude session in it; the page's own pause, which is a job).
+
+
+def need_slices(projects, name, what):
+    p = Project(projects, name)
+    if not slices():
+        raise Fail(f"ws {what} needs each stack in its own slice (WS_SLICES=1, the box)")
+    return p
+
+
+def slice_state(p):
+    """(FreezerState, ControlGroup, populated) of the stack's servers slice.
+    Populated: some process runs in it, frozen or not. Not its ActiveState:
+    a slice stays active while it holds a loaded unit, a failed one too."""
+    import boxtree
+    r = subprocess.run(["systemctl", "--user", "show", p.slice("servers"),
+                        "-p", "FreezerState", "-p", "ControlGroup"],
+                       capture_output=True, text=True)
+    d = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+    cg = d.get("ControlGroup", "")
+    events = boxtree.read(os.path.join(boxtree.CG_ROOT, cg.lstrip("/"), "cgroup.events")) if cg else ""
+    return d.get("FreezerState", ""), cg, "populated 1" in events.splitlines()
+
+
+def containers(projects, name):
+    """The stack's containers, [(id, state)]: the ones whose working-dir
+    label is in its folder, deepest folder first, as ws top counts them."""
+    import boxtree
+    stacks = {n: Project(projects, n).dir for n in projects}
+    fmt = "\t".join(["{{.ID}}", "{{.State}}", *('{{.Label "%s"}}' % k for k in boxtree.WORKDIR_LABELS)])
+    r = subprocess.run(["docker", "ps", "-a", "--format", fmt], capture_output=True, text=True)
+    if r.returncode:
+        raise Fail(f"docker ps failed: {r.stderr.strip()}")
+    out = []
+    for line in r.stdout.splitlines():
+        cid, state, *dirs = line.split("\t")
+        if any(d and boxtree.owner(d, stacks) == name for d in dirs):
+            out.append((cid, state))
+    return out
+
+
+def docker(verb, ids):
+    if ids and subprocess.run(["docker", verb, *ids], stdout=subprocess.DEVNULL).returncode:
+        raise Fail(f"docker {verb} {' '.join(ids)} failed")
+
+
+def cg_mb(cg, key):
+    import boxtree
+    v = boxtree.read(os.path.join(boxtree.CG_ROOT, cg.lstrip("/"), key), "").strip()
+    return f"{int(v) / 2**20:.0f} MB" if v.isdigit() else "?"
+
+
+def is_paused(projects, p):
+    freezer, _, _ = slice_state(p)
+    return (freezer not in ("running", "")) or any(
+        s == "paused" for _, s in containers(projects, p.name))
+
+
+def running(projects, p):
+    freezer, _, populated = slice_state(p)
+    return populated and freezer == "running"
+
+
+def pause(projects, name):
+    p = need_slices(projects, name, "pause")
+    lock = stack_lock(name)  # noqa: F841 (held until we return)
+    freezer, cg, populated = slice_state(p)
+    if not populated:
+        raise Fail(f"{name} isn't running (ws start {name})")
+    if freezer == "running":
+        print(f"==> {name}: freeze {p.slice('servers')}", flush=True)
+        if subprocess.run(["systemctl", "--user", "freeze", p.slice("servers")]).returncode:
+            raise Fail(f"systemctl --user freeze {p.slice('servers')} failed")
+    ids = [c for c, s in containers(projects, name) if s == "running"]
+    if ids:
+        print(f"==> {name}: docker pause ({len(ids)} containers)", flush=True)
+        docker("pause", ids)
+    # Out to swap now, rather than page by page as the next stack asks for
+    # the room. The kernel takes what it can and says EAGAIN for the rest:
+    # what a full swap or locked pages keep in. Containers are under
+    # Docker's root-owned cgroups: theirs goes out as the room is needed.
+    import boxtree
+    reclaim = os.path.join(boxtree.CG_ROOT, cg.lstrip("/"), "memory.reclaim")
+    if cg and os.path.exists(reclaim):
+        print(f"==> {name}: its servers' memory out to swap", flush=True)
+        try:
+            with open(reclaim, "w") as f:
+                f.write(str(2**40))
+        except OSError:
+            pass
+    want(name, "paused")
+    print(f"{name}: paused; its servers hold {cg_mb(cg, 'memory.current')} in memory, "
+          f"{cg_mb(cg, 'memory.swap.current')} in swap (ws resume {name})")
+
+
+def thaw(projects, p, quiet_if_not_paused=False):
+    """Unpause the stack's containers (first: the servers talk to them),
+    then thaw its servers. Says so if there was nothing to do."""
+    freezer, _, _ = slice_state(p)
+    ids = [c for c, s in containers(projects, p.name) if s == "paused"]
+    if ids:
+        print(f"==> {p.name}: docker unpause ({len(ids)} containers)", flush=True)
+        docker("unpause", ids)
+    if freezer not in ("running", ""):
+        print(f"==> {p.name}: thaw {p.slice('servers')}", flush=True)
+        if subprocess.run(["systemctl", "--user", "thaw", p.slice("servers")]).returncode:
+            raise Fail(f"systemctl --user thaw {p.slice('servers')} failed")
+    elif not ids and not quiet_if_not_paused:
+        raise Fail(f"{p.name} isn't paused")
+
+
+def resume(projects, name):
+    p = need_slices(projects, name, "resume")
+    lock = stack_lock(name)  # noqa: F841 (held until we return)
+    thaw(projects, p)
+    want(name, "running")
+    print(f"{name}: resumed; what's in swap comes back as it's used")
+
+
+def switch(projects, name, extras):
+    """Every other running stack paused, then this one resumed, or started
+    if it isn't running."""
+    p = need_slices(projects, name, "switch")
+    check_extras(p, extras)
+    if extras and is_paused(projects, p):
+        raise Fail(f"{name} is paused: it resumes as it was, without --with "
+                   f"(or ws stop {name} first, and switch to start it afresh)")
+    for other in projects:
+        if other != name and Project(projects, other).runs and running(projects, Project(projects, other)):
+            pause(projects, other)
+    if is_paused(projects, p):
+        resume(projects, name)
+    elif running(projects, p):
+        print(f"{name}: running already")
+    else:
+        own(projects, name, "start", extras)
+
+
+# ------------------------------------------------------------------ restore
+#
+# A reboot (the weekly maintenance's, a crash) ends every stack, paused ones
+# too. So the box keeps what each one should be: every start, stop, pause
+# and resume records it in STATE/intent/NAME.json, and after a boot `ws
+# restore` (devbox-restore.service) brings them back one at a time. Each
+# that was paused is started, left until its servers go quiet (its apps
+# compiled: a paused half-built stack resumes slowly), and paused, so the
+# next one starts with the room to itself; the one that was running starts
+# last. Each step is a job of the stack, as the page's buttons are: the page
+# and `ws jobs` show how it's going. A start that fails is tried once more
+# (Supabase's health wait gives up now and then on a cold start).
+
+SETTLE_QUIET = 0.15  # cores
+SETTLE_HOLD = float(os.environ.get("WS_SETTLE_HOLD", "60"))
+SETTLE_TIMEOUT = float(os.environ.get("WS_SETTLE_TIMEOUT", "1200"))
+SETTLE_EVERY = float(os.environ.get("WS_SETTLE_EVERY", "5"))
+START_TRIES = 2
+
+
+def intent_path(name):
+    return os.path.join(STATE, "intent", f"{name}.json")
+
+
+def intent(name):
+    try:
+        with open(intent_path(name)) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def want(name, state, extras=None):
+    """Record what the stack should be after a reboot (the box only).
+    `extras`: what it starts with; None keeps what the last start had."""
+    if not slices():
+        return
+    old = intent(name) or {}
+    path = intent_path(name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.new"
+    with open(tmp, "w") as f:
+        json.dump({"state": state, "with": list(extras) if extras is not None else old.get("with", []),
+                   "at": time.time()}, f)
+    os.replace(tmp, path)
+
+
+def settle(p):
+    """Wait until the stack's servers have used SETTLE_QUIET cores or less
+    for SETTLE_HOLD seconds. False if they haven't in SETTLE_TIMEOUT."""
+    import boxtree
+    _, cg, _ = slice_state(p)
+    stat = os.path.join(boxtree.CG_ROOT, cg.lstrip("/"), "cpu.stat")
+
+    def usage():
+        return next((int(l.split()[1]) for l in boxtree.read(stat).splitlines()
+                     if l.startswith("usage_usec ")), 0)
+    start = last_t = time.monotonic()
+    last_u, quiet = usage(), 0.0
+    while True:
+        time.sleep(SETTLE_EVERY)
+        t, u = time.monotonic(), usage()
+        cores = (u - last_u) / 1e6 / max(t - last_t, 1e-6)
+        quiet = quiet + (t - last_t) if cores <= SETTLE_QUIET else 0.0
+        last_t, last_u = t, u
+        if quiet >= SETTLE_HOLD:
+            return True
+        if t - start >= SETTLE_TIMEOUT:
+            return False
+
+
+def step(projects, name, action, extras=()):
+    """`ws ACTION NAME` as a job of the stack, followed to its end."""
+    cmd = shlex.join([os.path.realpath(__file__), action, name, *(w for x in extras for w in ("--with", x))])
+    try:
+        return run_job(projects, name, action, cmd, wait=True, parallel=True) == 0
+    except Fail as e:
+        print(f"ws: {e}", flush=True)
+        return False
+
+
+def wait_for_docker(timeout=180):
+    end = time.monotonic() + timeout
+    while subprocess.run(["docker", "info"], capture_output=True).returncode:
+        if time.monotonic() > end:
+            raise Fail("Docker isn't answering (docker info): nothing restored")
+        time.sleep(3)
+
+
+def room_note(projects, name, action):
+    """(The box) before a start, resume or switch: whether the stack has the
+    room, from what the control server recorded (control/watch.py room()).
+    A note to learn from, never a refusal."""
+    if not slices():
+        return
+    try:
+        sys.path.insert(0, os.path.join(HERE, "control"))
+        import watch
+        if not os.path.isdir(watch.WATCH):
+            return
+        import claude_usage
+        import socket
+        tree = box_tree(projects, action)
+        stacks = {n: Project(projects, n).dir for n in projects}
+        sessions = claude_usage.summary(stacks, STATE, alive=alive, host=socket.gethostname())["sessions"]
+        now = time.time()
+        r = watch.report(watch.load(watch.WATCH, now - 7 * 86400), tree, sessions, now)
+        print(f"ws: room: {watch.room(r, name, action)['text']}", flush=True)
+    except Exception as e:  # noqa: BLE001 - a note; the action goes on
+        print(f"ws: room: can't tell ({type(e).__name__}: {e})", flush=True)
+
+
+# ------------------------------------------------------------------ Claude sessions
+#
+# ws claude NAME: `claude --remote-control` in the stack's tmux, as ws
+# session puts a pane there (on the box: the stack's sessions slice, so it
+# counts as the stack's). Each is a tmux session of its own, claude-N, so
+# each can be attached to alone; its Claude session id is ws's choice, and
+# its hooks (control/claude_sessions.py) write what it's doing under that id.
+
+
+def claude_module():
+    sys.path.insert(0, os.path.join(HERE, "control"))
+    import claude_sessions
+    return claude_sessions
+
+
+def tmux_sessions(sock):
+    r = subprocess.run(["tmux", "-L", sock, "list-sessions", "-F", "#{session_name}"],
+                       capture_output=True, text=True)
+    return set(r.stdout.split()) if r.returncode == 0 else None
+
+
+def claude_launch(projects, name):
+    import uuid
+    cs = claude_module()
+    p = Project(projects, name)
+    if not os.path.isdir(p.dir):
+        raise Fail(f"no {p.short(p.dir)}: ws up {name} first")
+    sock = f"ws-{name}"
+    have = tmux_sessions(sock)
+    n = 1
+    while have and f"claude-{n}" in have:
+        n += 1
+    tname, sid = f"claude-{n}", str(uuid.uuid4())
+    label = f"{name} {tname}"
+    settings = os.path.join(STATE, "claude", "launch-settings.json")
+    cs.write_atomic(settings, cs.settings(os.path.realpath(__file__)))
+    cmd = shlex.join(["claude", "--remote-control", label, "--session-id", sid, "--settings", settings])
+    argv = ["tmux", "-L", sock, "new-session", "-d", "-s", tname, "-c", p.dir, cmd]
+    if slices() and have is None:
+        # No tmux server for the stack yet: start it in its sessions slice.
+        argv = ["systemd-run", "--user", "--quiet", "--scope", f"--unit=ws-{esc(name)}-tmux.scope",
+                f"--slice={p.slice('sessions')}", "--", *argv]
+    if subprocess.run(argv).returncode:
+        raise Fail(f"{name}: tmux new-session {tname} failed")
+    r = subprocess.run(["tmux", "-L", sock, "display-message", "-p", "-t", f"={tname}:", "#{pane_pid}"],
+                       capture_output=True, text=True)
+    pid = int(r.stdout.strip()) if r.stdout.strip().isdigit() else None
+    rec = {"id": sid, "stack": name, "socket": sock, "tmux": tname, "name": label, "dir": p.dir,
+           "started_at": time.time(), "pid": pid, "pid_start": cs.proc_start(pid) if pid else None}
+    path = os.path.join(cs.folder(STATE, "launched"), f"{sid}.json")
+    cs.write_atomic(path, rec)
+    # The link: claude prints it once Remote Control has connected. A folder
+    # it hasn't been told to trust asks first (and holds the hooks back).
+    for _ in range(int(CLAUDE_URL_WAIT * 2)):
+        url = cs.find_url(rec)
+        if url:
+            rec["url"] = url
+            cs.write_atomic(path, rec)
+            break
+        if cs.trust_prompt(rec):
+            rec["waiting"] = "trust"
+            cs.write_atomic(path, rec)
+            break
+        if not cs.alive(rec):
+            raise Fail(f"{name}: claude exited at once (tmux -L {sock}; claude --remote-control needs a login)")
+        time.sleep(0.5)
+    print(f"{label}: started")
+    if rec.get("waiting") == "trust":
+        print(f"  it asks whether to trust {p.short(p.dir)}: answer in its terminal, or ws claude-trust {name} {tname}")
+    print(f"  in the Claude app: {rec.get('url') or 'its link shows on the page once claude prints it'}")
+    print(f"  in a terminal:     ssh -t {BOX_SSH} tmux -L {sock} attach -t {tname}")
+    return rec
+
+
+CLAUDE_URL_WAIT = float(os.environ.get("WS_CLAUDE_URL_WAIT", "30"))
+# How the Mac reaches the box (its ssh config / Tailscale name): for the
+# attach command shown.
+BOX_SSH = os.environ.get("WS_BOX_SSH", "devbox")
+
+
+def claude_list(projects, name=None):
+    cs = claude_module()
+    if name:
+        Project(projects, name)
+    rows = cs.sessions(STATE, name)
+    if not rows:
+        print("no Claude sessions started with ws claude" + (f" in {name}" if name else ""))
+    for r in rows:
+        since = time.strftime("%H:%M", time.localtime(r["state_at"])) if r.get("state_at") else ""
+        print(f"{r['stack']:14} {r['tmux']:10} {r['state']:12} {since:6} {r.get('url') or ''}")
+        if r["state"] != "ended":
+            print(f"{'':14} ssh -t {BOX_SSH} {r['attach']}")
+
+
+def claude_trust(projects, name, tname):
+    """Answer a session's "trust this folder?" with yes, if that's what its
+    pane shows: the press of a button, for the stack's own folder."""
+    cs = claude_module()
+    Project(projects, name)
+    rec = next((r for r in cs.sessions(STATE, name) if r["tmux"] == tname and r["state"] != "ended"), None)
+    if not rec:
+        raise Fail(f"{name}: no running Claude session {tname} (ws claudes {name})")
+    if not cs.trust_prompt(rec):
+        raise Fail(f"{name} {tname} isn't asking to trust its folder")
+    target = f"={tname}:"
+    for key in ("Down", "Enter"):  # "No, exit" is first, "Yes, I trust this folder" second
+        subprocess.run(["tmux", "-L", rec["socket"], "send-keys", "-t", target, key])
+        time.sleep(0.3)
+    path = os.path.join(cs.folder(STATE, "launched"), f"{rec['id']}.json")
+    stored = cs.read(path) or {}
+    stored.pop("waiting", None)
+    cs.write_atomic(path, stored)  # answered: the page stops offering it now
+    for _ in range(int(CLAUDE_URL_WAIT * 2)):
+        url = cs.find_url(rec)
+        if url:
+            stored["url"] = url
+            cs.write_atomic(path, stored)
+            break
+        time.sleep(0.5)
+    print(f"{name} {tname}: trusts {rec['dir']}" + (f"; {stored['url']}" if stored.get("url") else ""))
+
+
+def claude_end(projects, name, tname):
+    Project(projects, name)
+    if not re.fullmatch(r"claude-\d+", tname):
+        raise Fail(f"{tname!r}: a session ws claude started is claude-N (ws claudes {name})")
+    if subprocess.run(["tmux", "-L", f"ws-{name}", "kill-session", "-t", f"={tname}"]).returncode:
+        raise Fail(f"{name}: no tmux session {tname} (ws claudes {name})")
+    print(f"{name} {tname}: ended")
+
+
+def remember(projects):
+    """Record each stack as it is now, where nothing is recorded yet (a box
+    from before ws kept it): what it starts with, from which of its
+    optional parts' units are up."""
+    if not slices():
+        raise Fail("ws remember is for the box (WS_SLICES=1)")
+    for n in projects:
+        p = Project(projects, n)
+        if not p.runs or intent(n):
+            continue
+        state = "paused" if is_paused(projects, p) else "running" if running(projects, p) else None
+        if not state:
+            continue
+        extras = [x for x, o in p.optional.items() if "start" in o and subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", p.unit(x)]).returncode == 0]
+        want(n, state, extras)
+        print(f"{n}: {state}" + (f" with {', '.join(extras)}" if extras else ""))
+
+
+def restore(projects):
+    if not slices():
+        raise Fail("ws restore is for the box (WS_SLICES=1): it brings its stacks back after a boot")
+    wanted = [(n, intent(n)) for n in projects if Project(projects, n).runs]
+    wanted = [(n, w) for n, w in wanted if w and w.get("state") in ("running", "paused")]
+    if not wanted:
+        print("nothing to restore: no stack was running or paused")
+        return
+    # The paused ones first, each paused before the next starts; then the
+    # running one(s), in the order they were started.
+    wanted.sort(key=lambda nw: (nw[1]["state"] != "paused", nw[1].get("at", 0)))
+    print("restoring: " + ", ".join(f"{n} ({w['state']})" for n, w in wanted), flush=True)
+    wait_for_docker()
+    failed = []
+    for n, w in wanted:
+        p = Project(projects, n)
+        if running(projects, p) or is_paused(projects, p):
+            print(f"{n}: up already", flush=True)
+            continue
+        extras = [x for x in w.get("with", []) if x in p.optional]
+        for i in range(START_TRIES):
+            if i:
+                print(f"==> {n}: the start failed; once more", flush=True)
+            if step(projects, n, "start", extras):
+                break
+        else:
+            failed.append(n)
+            continue
+        if w["state"] == "paused":
+            print(f"==> {n}: waiting for its servers to go quiet", flush=True)
+            if not settle(p):
+                print(f"==> {n}: still busy after {SETTLE_TIMEOUT / 60:.0f} min; pausing it anyway", flush=True)
+            if not step(projects, n, "pause"):
+                failed.append(n)
+    if failed:
+        raise Fail(f"not restored: {', '.join(failed)} (ws jobs NAME, ws logs NAME start)")
+    print("restored: " + ", ".join(f"{n} ({w['state']})" for n, w in wanted))
+
+
+def session(projects, name, label=None):
+    """Replaces ws with tmux, in the project's folder. On the box each stack
+    has its own tmux server (socket ws-NAME), started in its sessions slice:
+    tmux puts each pane in a scope next to itself, so a Claude session there,
+    and whatever it starts, counts as the stack's."""
+    p = Project(projects, name)
+    if not os.path.isdir(p.dir):
+        raise Fail(f"no {p.short(p.dir)}: ws up {name} first")
+    sock = f"ws-{name}"
+    argv = ["tmux", "-L", sock, "new", "-A", "-s", label or name, "-c", p.dir]
+    running = subprocess.run(["tmux", "-L", sock, "has-session"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if slices() and not running:
+        argv = ["systemd-run", "--user", "--quiet", "--scope", f"--unit=ws-{esc(name)}-tmux.scope",
+                f"--slice={p.slice('sessions')}", "--", *argv]
+    sys.stdout.flush()
+    os.execvp(argv[0], argv)
+
+
+# ------------------------------------------------------------------ jobs
+#
+# ws run starts `ws _exec`, detached: on the Mac in a process group of its
+# own, on the box as a unit in the project's jobs slice (so the control
+# plane sees it, and MemoryMax keeps a build from pushing out the stack or
+# the Claude session: past the cap the kernel kills the job, not them).
+# _exec queues on the project's lock (one job at a time), runs the command
+# with its output to the log, and records how it ended in meta.json.
+
+STATE = os.environ.get("WS_STATE", os.path.expanduser("~/.local/state/ws"))
+JOB_MEMORY_MAX = os.environ.get("WS_JOB_MEMORY_MAX", "6G")
+ACTIVE = ("queued", "running")
+
+
+def job_dir(stack, job):
+    return os.path.join(STATE, "jobs", stack, job)
+
+
+def read_meta(d):
+    try:
+        with open(os.path.join(d, "meta.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_meta(d, meta):
+    tmp = os.path.join(d, "meta.json.new")
+    with open(tmp, "w") as f:
+        json.dump(meta, f, indent=1)
+    os.replace(tmp, os.path.join(d, "meta.json"))
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def job_state(meta):
+    """Its state, or "lost": queued or running, but its process is gone
+    (the machine rebooted, it was killed -9) and nobody wrote an ending."""
+    s = meta.get("state")
+    if s in ACTIVE:
+        pid = meta.get("pid")
+        if pid is None:
+            # Asked for, its runner not started yet.
+            return s if time.time() - meta.get("queued_at", 0) < 30 else "lost"
+        if not alive(pid):
+            return "lost"
+    return s
+
+
+def run_job(projects, name, job, cmd, wait, parallel):
+    p = Project(projects, name)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", job):
+        raise Fail(f"job name {job!r}: letters, digits, . _ - only")
+    if cmd is None:
+        if job not in p.jobs:
+            raise Fail(f"{name} has no job {job!r} in {MANIFEST}" +
+                       (f" (has: {', '.join(p.jobs)})" if p.jobs else "") +
+                       f"; or give the command: ws run {name} {job} -- COMMAND")
+        cmd = p.jobs[job]
+    if not os.path.isdir(p.dir):
+        raise Fail(f"no {p.short(p.dir)}: ws up {name} first")
+    d = job_dir(name, job)
+    os.makedirs(d, exist_ok=True)
+    old = read_meta(d)
+    if old and job_state(old) in ACTIVE:
+        raise Fail(f"{name}/{job} is {job_state(old)} already (ws logs {name} {job}; ws cancel {name} {job})")
+    write_meta(d, {"stack": name, "job": job, "cmd": cmd, "dir": p.dir, "state": "queued",
+                   "queued_at": time.time(), "pid": None, "parallel": parallel,
+                   "unit": p.job_unit(job) if slices() else None,
+                   "memory_max": JOB_MEMORY_MAX if slices() else None})
+    open(os.path.join(d, "log"), "w").close()
+    runner = [sys.executable, os.path.realpath(__file__), "_exec", d,
+              *(["--parallel"] if parallel else []), "--", *p.argv(cmd)]
+    if slices():
+        if subprocess.run(["systemd-run", "--user", "--quiet", f"--unit={p.job_unit(job)}",
+                           f"--slice={p.slice('jobs')}", "--collect",
+                           f"--description={name} job {job}: {cmd}",
+                           "-p", f"MemoryMax={JOB_MEMORY_MAX}",
+                           # After a kill at the cap, systemd would stop the
+                           # unit, and the runner would record "cancelled".
+                           "-p", "OOMPolicy=continue",
+                           f"--working-directory={p.dir}",
+                           *(f"--setenv={k}" for k in unit_env()),
+                           "--", *runner]).returncode:
+            raise Fail(f"systemd-run for {name}/{job} failed")
+    else:
+        subprocess.Popen(runner, cwd=p.dir, start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not wait:
+        print(f"{name}/{job}: started{' (queued behind the running job)' if not parallel else ''}. "
+              f"Output: ws logs {name} {job} -f; all: ws jobs {name}")
+        return 0
+    return follow(d)
+
+
+def follow(d, until_done=True):
+    """Print the log as it grows; when the job has ended, its exit code."""
+    pos = 0
+    while True:
+        meta = read_meta(d) or {}
+        state = job_state(meta)
+        try:
+            with open(os.path.join(d, "log"), "rb") as f:
+                f.seek(pos)
+                chunk = f.read()
+        except OSError:
+            chunk = b""
+        if chunk:
+            pos += len(chunk)
+            sys.stdout.write(chunk.decode(errors="replace"))
+            sys.stdout.flush()
+        if state not in ACTIVE or not until_done:
+            if until_done:
+                print(f"==> {meta.get('stack')}/{meta.get('job')}: {describe(meta)}", flush=True)
+            break
+        time.sleep(0.3)
+    return {"ok": 0, "cancelled": 130}.get(state, meta.get("exit") if (meta.get("exit") or 0) > 0 else 1)
+
+
+def describe(meta):
+    s = job_state(meta)
+    code = meta.get("exit")
+    if s == "failed" and meta.get("oom"):
+        return f"failed: over the memory cap ({meta.get('memory_max') or JOB_MEMORY_MAX}, WS_JOB_MEMORY_MAX)"
+    if s == "failed" and code is not None:
+        return f"failed (signal {-code})" if code < 0 else f"failed (exit {code})"
+    return s
+
+
+def oom_kills():
+    """The kernel's count of memory-cap kills in this process's cgroup
+    (memory.events), or None where there are no cgroups (the Mac)."""
+    path = os.environ.get("WS_MEMORY_EVENTS")
+    if not path:
+        try:
+            with open("/proc/self/cgroup") as f:
+                rel = next(l.split("::", 1)[1].strip() for l in f if l.startswith("0::"))
+        except (OSError, StopIteration):
+            return None
+        path = f"/sys/fs/cgroup{rel}/memory.events"
+    try:
+        with open(path) as f:
+            return next((int(l.split()[1]) for l in f if l.startswith("oom_kill ")), 0)
+    except OSError:
+        return None
+
+
+def duration(meta):
+    start = meta.get("started_at")
+    if not start:
+        return ""
+    secs = int((meta.get("ended_at") or time.time()) - start)
+    return f"{secs // 60}m{secs % 60:02d}s" if secs >= 60 else f"{secs}s"
+
+
+def jobs(name=None):
+    root = os.path.join(STATE, "jobs")
+    stacks = [name] if name else sorted(os.listdir(root)) if os.path.isdir(root) else []
+    rows = []
+    for s in stacks:
+        sd = os.path.join(root, s)
+        for j in sorted(os.listdir(sd)) if os.path.isdir(sd) else []:
+            meta = read_meta(os.path.join(sd, j))
+            if meta:
+                rows.append((meta.get("queued_at", 0), s, j, meta))
+    if not rows:
+        print(f"no jobs{' for ' + name if name else ''} (ws run NAME JOB -- COMMAND)")
+    for _, s, j, meta in sorted(rows):
+        who = j if name else f"{s}/{j}"
+        print(f"{who:24} {describe(meta):24} {duration(meta):>8}  {meta.get('cmd', '')[:80]}")
+
+
+def logs(name, job, keep_following):
+    d = job_dir(name, job)
+    if not read_meta(d):
+        raise Fail(f"no job {name}/{job} (ws jobs {name})")
+    if keep_following:
+        return follow(d)
+    with open(os.path.join(d, "log"), errors="replace") as f:
+        sys.stdout.write(f.read())
+    return 0
+
+
+def cancel(name, job):
+    d = job_dir(name, job)
+    meta = read_meta(d)
+    if not meta or job_state(meta) not in ACTIVE:
+        raise Fail(f"{name}/{job} isn't queued or running (ws jobs {name})")
+    if meta.get("unit"):
+        subprocess.run(["systemctl", "--user", "stop", meta["unit"]])
+    elif meta.get("pid"):
+        try:
+            os.killpg(meta["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(50):
+        m = read_meta(d)
+        if job_state(m) not in ACTIVE:
+            break
+        time.sleep(0.1)
+    m = read_meta(d)
+    if job_state(m) in ACTIVE or m.get("state") in ACTIVE:
+        m.update(state="cancelled", ended_at=time.time())
+        write_meta(d, m)
+    print(f"{name}/{job}: cancelled")
+
+
+class Cancelled(Exception):
+    pass
+
+
+def job_exec(d, parallel, argv):
+    """The runner (ws _exec): queue, run, record."""
+    meta = read_meta(d)
+    meta["pid"] = os.getpid()
+    write_meta(d, meta)
+    child = None
+    stopping = []
+
+    def on_term(sig, frame):
+        stopping.append(sig)
+        if child is None:
+            raise Cancelled()
+        child.send_signal(sig)
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    lock = None
+    try:
+        if not parallel:
+            lock = open(os.path.join(os.path.dirname(d), ".lock"), "w")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        meta.update(state="running", started_at=time.time())
+        write_meta(d, meta)
+        ooms = oom_kills()
+        with open(os.path.join(d, "log"), "ab") as out:
+            child = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            rc = child.wait()
+    except Cancelled:
+        meta.update(state="cancelled", ended_at=time.time())
+        write_meta(d, meta)
+        return 130
+    after = oom_kills()
+    oom = ooms is not None and after is not None and after > ooms
+    meta.update(ended_at=time.time(), exit=rc, oom=oom,
+                state="failed" if oom or (rc and not stopping) else "cancelled" if stopping else "ok")
+    write_meta(d, meta)
+    return 0
+
+
+def box_tree(projects, what):
+    """boxtree's tree of the box now, with ws's jobs in it."""
+    sys.path.insert(0, os.path.join(HERE, "control"))
+    import boxtree
+    if not os.path.exists(os.path.join(boxtree.CG_ROOT, "cgroup.controllers")):
+        raise Fail(f"ws {what} reads Linux's cgroups (v2, {boxtree.CG_ROOT}): run it on the box")
+    root = os.path.join(STATE, "jobs")
+    metas = [read_meta(os.path.join(root, s, j))
+             for s in (os.listdir(root) if os.path.isdir(root) else [])
+             for j in os.listdir(os.path.join(root, s)) if os.path.isdir(os.path.join(root, s, j))]
+    return boxtree.sample({n: Project(projects, n).dir for n in projects}, interval=1.0,
+                          jobs=[m for m in metas if m])
+
+
+def top(projects, as_json):
+    import boxtree
+    tree = box_tree(projects, "top")
+    print(json.dumps(tree, indent=1) if as_json else boxtree.render(tree))
+
+
+def peaks(projects, args):
+    days = [a for a in args if a != "--json"]
+    if len(days) > 1 or (days and not days[0].isdigit()):
+        raise Fail("ws peaks [DAYS] [--json]")
+    days = int(days[0]) if days else 7
+    tree = box_tree(projects, "peaks")
+    import claude_usage
+    import socket
+    import watch
+    if not os.path.isdir(watch.WATCH):
+        raise Fail(f"nothing recorded in {watch.WATCH}: devbox-control records it (on the Mac: make update)")
+    stacks = {n: Project(projects, n).dir for n in projects}
+    sessions = claude_usage.summary(stacks, STATE, alive=alive, host=socket.gethostname())["sessions"]
+    now = time.time()
+    r = watch.report(watch.load(watch.WATCH, now - days * 86400), tree, sessions, now, days)
+    print(json.dumps(r, indent=1) if "--json" in args else watch.render(r))
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    cmd, args = argv[0], argv[1:]
+    if cmd == "claude-hook" and not args:
+        return claude_module().hook_main()
+    if cmd == "statusline" and not args:
+        sys.path.insert(0, os.path.join(HERE, "control"))
+        import claude_usage
+        return claude_usage.main()
+    # run and _exec: everything after -- is the command, untouched.
+    if cmd in ("run", "_exec"):
+        command = None
+        if "--" in args:
+            i = args.index("--")
+            args, command = args[:i], args[i + 1:]
+        flags = [a for a in args if a.startswith("--")]
+        pos = [a for a in args if not a.startswith("--")]
+        if cmd == "_exec":
+            return job_exec(pos[0], "--parallel" in flags, command)
+        if len(pos) != 2 or set(flags) - {"--wait", "--parallel"}:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+        if command is not None:
+            command = command[0] if len(command) == 1 else shlex.join(command)
+        return run_job(load(), pos[0], pos[1], command, "--wait" in flags, "--parallel" in flags)
+    if cmd == "jobs" and len(args) <= 1:
+        jobs(*args)
+        return 0
+    if cmd == "logs" and len(args) in (2, 3) and args[2:] in ([], ["-f"]):
+        return logs(args[0], args[1], args[2:] == ["-f"])
+    if cmd == "cancel" and len(args) == 2:
+        cancel(*args)
+        return 0
+    extras = []
+    while "--with" in args:
+        i = args.index("--with")
+        if i + 1 >= len(args):
+            raise Fail("--with needs a name")
+        extras.append(args[i + 1])
+        del args[i:i + 2]
+    projects = load()
+    if cmd == "list":
+        for n, p in projects.items():
+            print(f"{n:20} {p.get('about', '')}")
+        return 0
+    if cmd == "top":
+        top(projects, "--json" in args)
+        return 0
+    if cmd == "peaks":
+        peaks(projects, args)
+        return 0
+    if cmd == "session" and len(args) == 2:
+        session(projects, *args)
+    if cmd == "claude" and len(args) == 1 and not extras:
+        claude_launch(projects, args[0])
+        return 0
+    if cmd == "claudes" and len(args) <= 1:
+        claude_list(projects, *args)
+        return 0
+    if cmd == "claude-trust" and len(args) == 2:
+        claude_trust(projects, *args)
+        return 0
+    if cmd == "claude-end" and len(args) == 2:
+        claude_end(projects, *args)
+        return 0
+    if cmd == "restore" and not args and not extras:
+        restore(projects)
+        return 0
+    if cmd == "remember" and not args and not extras:
+        remember(projects)
+        return 0
+    if len(args) != 1:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    name = args[0]
+    if cmd == "plan":
+        plan(projects, name, extras)
+    elif cmd == "up":
+        up(projects, name, extras)
+    elif cmd in ("start", "check"):
+        if cmd == "start":
+            room_note(projects, name, "start")
+        own(projects, name, cmd, extras)
+    elif cmd == "stop":
+        stop(projects, name)
+    elif cmd == "pause" and not extras:
+        pause(projects, name)
+    elif cmd == "resume" and not extras:
+        room_note(projects, name, "resume")
+        resume(projects, name)
+    elif cmd == "switch":
+        room_note(projects, name, "switch")
+        switch(projects, name, extras)
+    elif cmd == "session":
+        session(projects, name)
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Fail as e:
+        print(f"ws: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

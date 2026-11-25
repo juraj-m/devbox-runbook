@@ -1,0 +1,10 @@
+[Unit]
+Description=Outbound allowlist: the DNS server that answers only for listed domains
+# Started by devbox-egress apply (devbox-egress.service at boot), after the
+# nftables sets it fills exist; not enabled on its own.
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --pid-file= --conf-file=/etc/devbox/egress-dns.conf
+Restart=always
+RestartSec=2

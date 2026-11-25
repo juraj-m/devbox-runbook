@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# GitHub tokens on the box: one per owner, plus read-only ones for single repos.
+#
+# A fine-grained token covers one resource owner (my account or one org), so
+# the box holds one token per owner and picks it by the repo being touched:
+#   git: git-credential-devbox (credential.useHttpPath hands it OWNER/REPO)
+#   gh:  the /usr/local/bin/gh wrapper sets GH_TOKEN
+# A repo token (OWNER/REPO) wins over the owner token for that repo. The
+# secrets repos (PROTECTED below) are reached only that way: the owner tokens
+# leave them out, and their repo tokens can read but not push.
+#
+#   devbox-github set OWNER[/REPO]   store a token (prompts), then check it
+#   devbox-github check [TARGET ...] for each token: who, what it reaches,
+#                                    expiry; and that no token can push to a
+#                                    PROTECTED repo (exit 1 if one can)
+#   devbox-github import [FILE]      store the tokens from a sops dotenv file
+#                                    (default: $DEVBOX_SECRETS/devbox/github-tokens.dev.env,
+#                                    DEVBOX_SECRETS being ~/_/secrets;
+#                                    /dev/stdin works), decrypted with the box key
+#   devbox-github export             every stored token, encrypted as
+#                                    devbox/github-tokens.dev.env (sops, with
+#                                    $DEVBOX_SECRETS/.sops.yaml), to stdout. The
+#                                    laptop commits it: the box can't push there
+#   devbox-github target ARGS        OWNER/REPO (or OWNER) a gh command line is about
+#   devbox-github owner ARGS         just the OWNER of that
+#   devbox-github token TARGET       the token for OWNER/REPO or OWNER
+set -euo pipefail
+DIR=${DEVBOX_GITHUB_DIR:-$HOME/.config/devbox/github}
+GH=${DEVBOX_GH:-/usr/bin/gh}
+# From the environment (bootstrap puts them in ~/.zshenv), else from the
+# box's settings (/etc/devbox/devbox.conf, from box/devbox.conf).
+conf() { (. /etc/devbox/devbox.conf 2>/dev/null && eval "printf %s \"\${$1:-}\"") || true; }
+# The owner a gh command means when it names none (gh repo list, gh repo
+# create NAME, a directory that isn't a GitHub clone).
+DEFAULT_OWNER=${DEVBOX_GITHUB_OWNER:-$(conf GITHUB_DEFAULT_OWNER)}
+[ -n "$DEFAULT_OWNER" ] || { echo "devbox-github: no default owner (GITHUB_DEFAULT_OWNER in devbox.conf)" >&2; exit 2; }
+# Repos the box may read but never write, as "OWNER/REPO ...": your secrets
+# repos. The laptop runs their code (Makefiles, env writers) with prod
+# access, and their .sops.yaml decides who decrypts prod.
+PROTECTED=${DEVBOX_GITHUB_PROTECTED-$(conf GITHUB_PROTECTED)}
+# Your sops secrets repo on the box, for import and export.
+SECRETS=${DEVBOX_SECRETS:-$HOME/_/secrets}
+
+lower() { printf %s "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# OWNER -> $DIR/owner.token; OWNER/REPO -> $DIR/repos/owner/repo.token
+token_file() {
+	local t
+	t=$(lower "$1")
+	case $t in
+	*/*) printf '%s/repos/%s.token' "$DIR" "$t" ;;
+	*) printf '%s/%s.token' "$DIR" "$t" ;;
+	esac
+}
+
+# OWNER/REPO from a value like OWNER/REPO, OWNER/REPO.git, OWNER/REPO/pull/3;
+# just OWNER if that's all there is.
+target_of() {
+	local v=${1%/} owner rest repo
+	owner=${v%%/*}
+	[ "$owner" = "$v" ] && { printf '%s\n' "$owner"; return; }
+	rest=${v#*/}
+	repo=${rest%%/*}
+	repo=${repo%.git}
+	if [ -n "$repo" ]; then printf '%s/%s\n' "$owner" "$repo"; else printf '%s\n' "$owner"; fi
+}
+
+infer_target() {
+	[ -n "${GH_REPO:-}" ] && { target_of "$GH_REPO"; return; }
+	# gh repo list [OWNER], gh repo create [OWNER/]NAME: mine unless named.
+	# gh repo clone|view|fork|... OWNER/REPO.
+	if [ "${1:-}" = repo ]; then
+		local pos=${3:-}
+		[ "${pos#-}" = "$pos" ] || pos=""
+		case ${2:-} in
+		list) echo "${pos:-$DEFAULT_OWNER}"; return ;;
+		create) case $pos in */*) target_of "$pos" ;; *) echo "$DEFAULT_OWNER" ;; esac; return ;;
+		esac
+		[ -n "$pos" ] && { target_of "$pos"; return; }
+	fi
+	local prev="" a
+	for a in "$@"; do
+		case $prev in -R | --repo) target_of "$a"; return ;; --owner) target_of "${a%%/*}"; return ;; esac
+		case $a in
+		--repo=*) target_of "${a#*=}"; return ;;
+		--owner=*) a=${a#*=}; target_of "${a%%/*}"; return ;;
+		https://github.com/*/*) target_of "${a#https://github.com/}"; return ;;
+		repos/*/* | /repos/*/*) a=${a#/}; target_of "${a#repos/}"; return ;;
+		orgs/* | /orgs/*) a=${a#/}; a=${a#orgs/}; target_of "${a%%/*}"; return ;;
+		esac
+		prev=$a
+	done
+	local url
+	url=$(git remote get-url origin 2>/dev/null) || url=""
+	case $url in
+	git@github.com:*) target_of "${url#git@github.com:}"; return ;;
+	https://github.com/*) target_of "${url#https://github.com/}"; return ;;
+	esac
+	echo "$DEFAULT_OWNER"
+}
+
+token_for() {
+	local f
+	for t in "$1" "${1%%/*}" "$DEFAULT_OWNER"; do
+		f=$(token_file "$t")
+		[ -r "$f" ] && { cat "$f"; return; }
+	done
+	# Other people's public repos are readable with any token.
+	echo "devbox-github: no tokens; run: devbox-github set $DEFAULT_OWNER" >&2
+	return 1
+}
+
+expiry_of() {
+	GH_TOKEN=$1 $GH api -i user 2>/dev/null | tr -d '\r' |
+		sed -n 's/^[Gg]ithub-[Aa]uthentication-[Tt]oken-[Ee]xpiration: //p'
+}
+
+# What a token can do to a repo: push, admin, read, none, or unknown (no clear
+# answer). A repo's .permissions are the *user's* role (admin on my own repos),
+# not the token's, so they can't tell. Writes that can never succeed do, 403
+# without the permission, 422 with it:
+#   Contents write:       creating a ref at a sha that doesn't exist
+#   Administration write: adding a deploy key that isn't a key (a real one
+#                         with write access would push)
+# Only a 403 to both is "read". (Actions can't run anything there: the
+# secrets repos have no workflows, and adding one takes Contents write.)
+ZERO_SHA=0000000000000000000000000000000000000000
+refused() { case $1 in *"Resource not accessible"*"(HTTP 403)"*) return 0 ;; esac; return 1; }
+access() {
+	local out
+	if ! out=$(GH_TOKEN=$1 $GH api "repos/$2" --silent 2>&1); then
+		case $out in *"(HTTP 404)"*) echo none ;; *) echo unknown ;; esac
+		return
+	fi
+	out=$(GH_TOKEN=$1 $GH api -X POST "repos/$2/git/refs" -f ref=refs/heads/devbox-write-probe -f sha=$ZERO_SHA 2>&1) || true
+	if ! refused "$out"; then
+		case $out in *"(HTTP 422)"*) echo push ;; *) echo unknown ;; esac
+		return
+	fi
+	out=$(GH_TOKEN=$1 $GH api -X POST "repos/$2/keys" -f title=devbox-write-probe -f key=invalid -F read_only=false 2>&1) || true
+	if refused "$out"; then echo read
+	else case $out in *"(HTTP 422)"*) echo admin ;; *) echo unknown ;; esac; fi
+}
+
+check_one() {
+	local target=$1 t login repos
+	t=$(cat "$(token_file "$target")")
+	login=$(GH_TOKEN=$t $GH api user -q .login 2>/dev/null) || { echo "$target: token rejected"; return 1; }
+	case $target in
+	*/*) printf '%-18s as %s, %s, expires %s\n' "$target" "$login" "$(access "$t" "$target")" "$(expiry_of "$t")" ;;
+	*)
+		repos=$(GH_TOKEN=$t $GH repo list "$target" --limit 1000 --json name -q length 2>/dev/null) || repos="?"
+		printf '%-18s as %s, %s repos, expires %s\n' "$target" "$login" "$repos" "$(expiry_of "$t")"
+		;;
+	esac
+}
+
+# Every stored token against every PROTECTED repo: read at most. (Advisory:
+# a careful save checks again from the laptop: docs/ARCHITECTURE.md.)
+check_protected() {
+	local bad=0 f target p a
+	shopt -s nullglob
+	for f in "$DIR"/*.token "$DIR"/repos/*/*.token; do
+		target=${f#"$DIR"/}
+		target=${target#repos/}
+		target=${target%.token}
+		for p in $PROTECTED; do
+			a=$(access "$(cat "$f")" "$p")
+			case $a in
+			push) echo "UNSAFE: the $target token can push to $p. Take $p out of that token on github.com." >&2; bad=1 ;;
+			admin) echo "UNSAFE: the $target token can administer $p (deploy keys). Give it Contents read only, nothing else." >&2; bad=1 ;;
+			unknown) echo "UNKNOWN: GitHub gave no clear answer for the $target token on $p (rate limit? pending approval?). Try again later." >&2; bad=1 ;;
+			esac
+		done
+	done
+	for p in $PROTECTED; do
+		f=$(token_file "$p")
+		[ -r "$f" ] || echo "note: no read token for $p (devbox-github set $p), so the box can't pull it"
+	done
+	[ $bad -eq 0 ] && echo "protected repos ($PROTECTED): no token can push"
+	return $bad
+}
+
+# Dotenv key <-> target: GITHUB_TOKEN_MY_ORG -> my-org,
+# GITHUB_TOKEN_MY_ORG__SECRETS -> my-org/secrets. GitHub owner names have no
+# underscores, so "_" maps back to "-"; repo tokens are only for repos whose
+# names are lowercase letters, digits and "-" (set refuses others).
+key_to_target() {
+	local k=${1#GITHUB_TOKEN_}
+	case $k in
+	*__*) printf '%s/%s\n' "$(printf %s "${k%%__*}" | tr 'A-Z_' 'a-z-')" "$(printf %s "${k#*__}" | tr 'A-Z_' 'a-z-')" ;;
+	*) printf %s "$k" | tr 'A-Z_' 'a-z-'; echo ;;
+	esac
+}
+
+store() {
+	local f
+	f=$(token_file "$1")
+	install -d -m 700 "$DIR" "$(dirname "$f")"
+	(umask 077 && printf '%s\n' "$2" >"$f")
+}
+
+cmd=${1:-}
+shift || true
+case $cmd in
+set)
+	target=$(lower "${1:?usage: devbox-github set OWNER[/REPO]}")
+	case $target in
+	*/*/* | /* | */) echo "expected OWNER or OWNER/REPO" >&2; exit 2 ;;
+	*/*) [[ ${target#*/} =~ ^[a-z0-9-]+$ ]] || { echo "repo tokens: repo names of a-z, 0-9 and - only" >&2; exit 2; } ;;
+	esac
+	read -rsp "fine-grained token for $target: " t
+	echo
+	[[ $t == github_pat_* ]] || { echo "expected a fine-grained token (github_pat_...)" >&2; exit 1; }
+	store "$target" "$t"
+	check_one "$target"
+	# Report, don't fail: make github-tokens sets several tokens in a row, and
+	# an unsafe one elsewhere (not narrowed yet) mustn't stop the next prompt.
+	check_protected || echo "(stored anyway; make github-check must pass before you save the tokens anywhere)"
+	;;
+check)
+	rc=0
+	if [ $# -gt 0 ]; then
+		for o in "$@"; do check_one "$(lower "$o")" || rc=1; done
+	else
+		shopt -s nullglob
+		for f in "$DIR"/*.token "$DIR"/repos/*/*.token; do
+			o=${f#"$DIR"/}; o=${o#repos/}
+			check_one "${o%.token}" || rc=1
+		done
+	fi
+	check_protected || rc=1
+	exit $rc
+	;;
+import)
+	f=${1:-$SECRETS/devbox/github-tokens.dev.env}
+	# sops opens its input by path, which fails when stdin is a socket (as
+	# over Tailscale SSH). Read it into a file first; it's ciphertext.
+	if [ "$f" = - ] || [ "$f" = /dev/stdin ]; then
+		tmp=$(mktemp)
+		trap 'rm -f "$tmp"' EXIT
+		cat >"$tmp"
+		f=$tmp
+	fi
+	sops decrypt --input-type dotenv --output-type dotenv "$f" |
+		while IFS='=' read -r k v; do
+			case $k in GITHUB_TOKEN_*) ;; *) continue ;; esac
+			o=$(key_to_target "$k")
+			store "$o" "$v"
+			check_one "$o"
+		done
+	check_protected
+	;;
+export)
+	secrets=$SECRETS
+	[ -f "$secrets/.sops.yaml" ] || { echo "no $secrets/.sops.yaml (clone your secrets repo there, or set DEVBOX_SECRETS)" >&2; exit 1; }
+	shopt -s nullglob
+	files=("$DIR"/*.token "$DIR"/repos/*/*.token)
+	[ ${#files[@]} -gt 0 ] || { echo "no tokens stored" >&2; exit 1; }
+	# Encrypting needs only the recipients' public keys: no YubiKey, and the
+	# plaintext never leaves this pipe.
+	for f in "${files[@]}"; do
+		o=${f#"$DIR"/}; o=${o#repos/}; o=${o%.token}
+		case $o in
+		*/*) k="$(printf %s "${o%%/*}" | tr a-z- A-Z_)__$(printf %s "${o#*/}" | tr a-z- A-Z_)" ;;
+		*) k=$(printf %s "$o" | tr a-z- A-Z_) ;;
+		esac
+		printf 'GITHUB_TOKEN_%s=%s\n' "$k" "$(cat "$f")"
+	done | (cd "$secrets" && sops encrypt --input-type dotenv --output-type dotenv \
+		--filename-override devbox/github-tokens.dev.env /dev/stdin)
+	;;
+target) infer_target "$@" ;;
+owner) t=$(infer_target "$@"); echo "${t%%/*}" ;;
+token) token_for "$(lower "${1:?usage: devbox-github token OWNER[/REPO]}")" ;;
+*)
+	sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
+	exit 2
+	;;
+esac

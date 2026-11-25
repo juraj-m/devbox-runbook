@@ -1,0 +1,22 @@
+#!/bin/sh
+# Drop new connections from the public interface to Docker containers.
+#
+# Docker-published ports skip ufw, and daemon.json's "ip": "127.0.0.1" only
+# sets the default; a compose file that says "0.0.0.0:5432:5432" still
+# publishes to the internet. This rule in DOCKER-USER catches that case.
+# Replies to connections containers open themselves are ESTABLISHED, so they
+# pass. Tailnet traffic arrives on tailscale0 and is unaffected.
+set -eu
+PUB=$(ip -o route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+[ -n "$PUB" ] || { echo "no public interface found" >&2; exit 1; }
+RULE="-i $PUB -m conntrack --ctstate NEW -j DROP"
+case "${1:-start}" in
+start)
+	# Docker creates DOCKER-USER on start; this unit runs after docker.
+	iptables -C DOCKER-USER $RULE 2>/dev/null || iptables -I DOCKER-USER $RULE
+	echo "blocking new public connections to containers on $PUB"
+	;;
+stop)
+	iptables -D DOCKER-USER $RULE 2>/dev/null || true
+	;;
+esac

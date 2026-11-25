@@ -1,0 +1,51 @@
+# What the coding box may reach on the internet (devbox-egress;
+# docs/ARCHITECTURE.md, "Outbound allowlist"). A domain covers its subdomains. Addresses and CIDRs
+# work too, for a service with no name. Tailscale's own traffic needs no line.
+#
+# Add here and `make update`, or on the box (ssh root@devbox devbox-egress
+# allow <domain>) and later `make egress-sync`. Agents ask for one with
+# `devbox-egress request <domain> <why>`.
+
+## The box itself: packages, time, tools
+archive.ubuntu.com
+security.ubuntu.com
+ntp.ubuntu.com
+download.docker.com
+pkgs.tailscale.com
+cli.github.com
+
+## Claude
+anthropic.com
+claude.ai
+claude.com
+
+## GitHub (git, gh, release downloads, ghcr.io)
+github.com
+githubusercontent.com
+ghcr.io
+
+## Packages and toolchains
+npmjs.org
+yarnpkg.com
+nodejs.org
+pypi.org
+pythonhosted.org
+anaconda.org
+anaconda.com
+jdx.dev
+docker.io
+docker.com
+public.ecr.aws
+playwright.dev
+playwright.azureedge.net
+fonts.googleapis.com
+fonts.gstatic.com
+
+## The projects' dev and test services: mine, as an example. Replace with
+## what your projects call (audit mode tells you: devbox-egress blocked).
+supabase.co
+supabase.com
+cloudflare.com
+workers.dev
+stripe.com
+sentry.io

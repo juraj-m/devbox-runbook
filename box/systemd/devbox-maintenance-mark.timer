@@ -1,0 +1,12 @@
+# @PLACEHOLDERS@ are filled from devbox.conf by bootstrap.sh.
+[Unit]
+Description=Mark devbox maintenance as due (weekly; it then waits for idle time)
+
+[Timer]
+OnCalendar=@MAINTENANCE_DUE@ @TZ_NAME@
+# A missed mark should still happen when the box comes back: marking only
+# makes maintenance due, apply still waits for idle time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

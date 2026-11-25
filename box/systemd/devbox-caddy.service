@@ -1,0 +1,22 @@
+# Caddy between Tailscale's HTTPS (tailscale serve) and the projects' dev
+# servers: it compresses, which the dev servers don't. Listens on 127.0.0.2
+# only, on each project port + 10000; ws writes the per-project sites
+# (workspace/ws, `tailnet` in projects.toml) and reloads it. Runs as the dev
+# user: the config is the dev user's, and it binds no privileged port.
+# @PLACEHOLDERS@ are filled from devbox.conf by bootstrap.sh.
+[Unit]
+Description=devbox Caddy: compression for the dev servers Tailscale serves
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@DEV_USER@
+Group=@DEV_USER@
+ExecStart=/usr/local/bin/caddy run --config @DEV_HOME@/.config/devbox/caddy/Caddyfile --adapter caddyfile
+ExecReload=/usr/local/bin/caddy reload --config @DEV_HOME@/.config/devbox/caddy/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

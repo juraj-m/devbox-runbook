@@ -1,0 +1,106 @@
+#!/bin/sh
+# devbox weekly maintenance, done in idle time.
+#
+#   devbox-maintenance mark           weekly (timer, MAINTENANCE_DUE): maintenance is due.
+#   devbox-maintenance apply          hourly (timer): run it if due and idle.
+#   devbox-maintenance apply --force  now, idle or not.
+#   devbox-maintenance status         due? idle? why not?
+#
+# While maintenance is due, $PENDING exists; the out-of-office runner must
+# not start new work then, so the box drains into an idle window.
+#
+# Idle means all of:
+#   - no tmux client attached (I'm not looking at a session),
+#   - no tmux window has printed anything for IDLE_HOURS (an interactive
+#     Claude I left working is still busy),
+#   - no headless `claude -p` running (the runner, or anything scheduled).
+# A reboot ends the stacks; devbox-restore.service brings them back after
+# it (ws restore). An upgrade that restarts Docker but needs no reboot
+# would leave them without their containers, so then it reboots too.
+set -u
+# DEV_USER, DEV_HOME (bootstrap installs box/devbox.conf there).
+. /etc/devbox/devbox.conf
+IDLE_HOURS=2
+OVERDUE_DAYS=3
+PENDING=/var/lib/devbox/maintenance-pending
+
+busy_reason() {
+	if runuser -u "$DEV_USER" -- tmux list-clients 2>/dev/null | grep -q .; then
+		echo "a tmux client is attached"; return
+	fi
+	# window_activity is the last time a pane printed output. Verify on the
+	# box that a working, detached Claude keeps bumping it.
+	last=$(runuser -u "$DEV_USER" -- tmux list-windows -a -F '#{window_activity}' 2>/dev/null | sort -n | tail -1)
+	if [ -n "$last" ] && [ $(( $(date +%s) - last )) -lt $(( IDLE_HOURS * 3600 )) ]; then
+		echo "tmux output in the last ${IDLE_HOURS}h"; return
+	fi
+	if pgrep -u "$DEV_USER" -f '(^|/)claude( .*)? (-p|--print)( |$)' >/dev/null; then
+		echo "a headless claude run is active"; return
+	fi
+}
+
+# Whether ws has a stack that should be running or paused (ws restore
+# brings those back after a boot).
+stacks_wanted() {
+	grep -qlE '"state": "(running|paused)"' "$DEV_HOME"/.local/state/ws/intent/*.json 2>/dev/null
+}
+
+apply() {
+	export DEBIAN_FRONTEND=noninteractive
+	docker_since=$(systemctl show docker.service -p ActiveEnterTimestampMonotonic --value)
+	# unattended-upgrades only takes Ubuntu's security pocket. This takes
+	# everything else too: docker, tailscale, gh come from their own repos.
+	# On a dev box a full upgrade in the window is fine. Docker restarts here;
+	# containers with a restart policy come back.
+	if apt-get update -q; then
+		apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade \
+			|| echo "apt upgrade failed"
+		apt-get -y -q autoremove || true
+	else
+		echo "apt-get update failed"
+	fi
+	docker image prune -f || true
+	# BuildKit's cache isn't pruned by anything else (it reached 13 GB on prod).
+	docker builder prune -f --reserved-space 3g || echo "builder prune failed"
+	rm -f "$PENDING"
+	if [ -f /run/reboot-required ]; then
+		echo "reboot required by: $(sort -u /run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ')"
+		systemctl reboot
+	elif [ "$(systemctl show docker.service -p ActiveEnterTimestampMonotonic --value)" != "$docker_since" ] && stacks_wanted; then
+		# An upgraded Docker restarted under the stacks: their containers
+		# are gone, their servers aren't. After a reboot devbox-restore
+		# brings each back whole.
+		echo "docker restarted under the stacks: rebooting, devbox-restore brings them back"
+		systemctl reboot
+	else
+		echo "no reboot required"
+	fi
+}
+
+case "${1:-}" in
+mark)
+	mkdir -p "$(dirname "$PENDING")"
+	[ -f "$PENDING" ] || date -Is >"$PENDING"
+	echo "maintenance due since $(cat "$PENDING")"
+	;;
+apply)
+	if [ "${2:-}" = --force ]; then apply; exit; fi
+	[ -f "$PENDING" ] || exit 0
+	reason=$(busy_reason)
+	if [ -z "$reason" ]; then apply; exit; fi
+	echo "maintenance due, deferred: $reason"
+	if [ -n "$(find "$PENDING" -mtime +$OVERDUE_DAYS)" ]; then
+		logger -p user.warning -t devbox-maintenance \
+			"maintenance overdue since $(cat "$PENDING"); run as root: devbox-maintenance apply --force"
+	fi
+	;;
+status)
+	if [ -f "$PENDING" ]; then echo "due since $(cat "$PENDING")"; else echo "not due"; fi
+	reason=$(busy_reason)
+	echo "idle: ${reason:-yes}"
+	[ -f /run/reboot-required ] && echo "reboot required"
+	;;
+*)
+	echo "usage: $0 mark | apply [--force] | status" >&2; exit 2
+	;;
+esac

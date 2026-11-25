@@ -1,0 +1,36 @@
+# The box's control plane: what runs, grouped by stack, with its memory and
+# CPU (workspace/control), and each stack's start and stop, which it hands
+# to the dev user's own systemd (its file system here stays read-only:
+# server.py says how). Served on the tailnet at
+# https://<box>.<tailnet>.ts.net:7070 (the dev-server project's `tailnet` in
+# projects.toml; ws up dev-server publishes it).
+#
+# A system unit, so it starts at boot whoever is logged in; runs as the dev
+# user, which reads every cgroup and /proc entry it needs (no root) and the
+# Docker API (the docker group). It runs from the dev-server clone, so
+# `git pull` there and a restart update it.
+# @PLACEHOLDERS@ are filled from devbox.conf by bootstrap.sh.
+[Unit]
+Description=devbox control plane (workspace/control)
+After=network-online.target docker.service
+Wants=network-online.target
+# Until make sync has cloned dev-server, keep trying.
+StartLimitIntervalSec=0
+
+[Service]
+User=@DEV_USER@
+Group=@DEV_USER@
+Environment=DEV_BIND_HOST=127.0.0.1 WS_CONTROL_PORT=7070 WS_ROOT=@PROJECTS_DIR@
+# Its one writable folder, /var/lib/devbox-control (the dev user's): the
+# minutes watch.py keeps for the peaks (ws peaks reads them there too).
+StateDirectory=devbox-control
+Environment=WS_WATCH_DIR=/var/lib/devbox-control/watch
+ExecStart=/usr/bin/python3 -I @DEVBOX_DIR@/workspace/control/server.py
+Restart=always
+RestartSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

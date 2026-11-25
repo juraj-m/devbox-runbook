@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# The box's outbound allowlist: what the box may reach on the internet.
+#
+# A local DNS server (dnsmasq, on 127.0.0.3 and the Docker bridge address)
+# answers only for the listed domains (each with its subdomains) and puts the
+# addresses it hands out into an nftables set. Traffic leaving through the
+# public interface may go only to those addresses. Every DNS query that would
+# leave the box, from a process or a container, is turned to that server, so
+# nothing needs configuring per tool. tailscaled's own traffic (fwmark
+# 0x80000) is exempt: the tailnet is how the box is reached.
+#
+# Modes: audit (nothing blocked; what would be is logged, for building the
+# list), enforce (the rest is refused), off (no rules, DNS as before).
+#
+#   devbox-egress status              mode, list sizes, pending requests
+#   devbox-egress blocked [N]         the last N domains outside the list
+#   devbox-egress request <domain> <why>   ask the user to allow a domain
+#   devbox-egress pending             the requests waiting
+#   devbox-egress approve             (root, ssh -t) go through the requests
+#   devbox-egress allow <domain|ip|cidr>…  (root) add to the box's own list
+#   devbox-egress audit|enforce|off   (root) switch mode; enforce reverts to
+#                                     audit in 5 minutes unless confirmed
+#   devbox-egress confirm             (root) keep enforce
+#   devbox-egress apply               (root) load the lists and mode
+#   devbox-egress render dns|nft      print the generated config (tests)
+#   devbox-egress unsynced <list      the box's additions not in that list
+#
+# The list: /etc/devbox/egress.allow, from dev-server box/egress.allow
+# (replaced by make update), plus the box's own additions in
+# /var/lib/devbox/egress/local.allow, which `make egress-sync` brings back to
+# the repo. One entry a line: a domain (covering its subdomains), an IPv4 or
+# IPv6 address or CIDR. # starts a comment.
+set -euo pipefail
+
+ROOT=${EGRESS_ROOT:-}
+LIST=$ROOT/etc/devbox/egress.allow
+STATE=$ROOT/var/lib/devbox/egress
+LOCAL=$STATE/local.allow
+MODE_FILE=$STATE/mode
+REQUESTS=$ROOT/var/lib/devbox/egress-requests/queue
+DNS_CONF=$ROOT/etc/devbox/egress-dns.conf
+LOG=$ROOT/var/log/devbox-egress/dns.log
+
+TABLE=devbox_egress
+DNS_ADDR=127.0.0.3
+BRIDGE_ADDR=172.17.0.1
+DNS_USER=dnsmasq
+# The dev user reads the DNS log (devbox-egress blocked).
+LOG_READER=${EGRESS_LOG_READER:-$( (. "$ROOT/etc/devbox/devbox.conf" 2>/dev/null && printf %s "${DEV_USER:-}") || true)}
+LOG_READER=${LOG_READER:-root}
+TS_MARK=0x80000
+# Listed names are asked of one resolver pair, the rest (audit only) of
+# another, so the log tells them apart. (Not Quad9: it didn't answer from
+# the VPS provider's network this was built on.)
+UP_LISTED=(1.1.1.1 1.0.0.1)
+UP_OTHER=(8.8.8.8 8.8.4.4)
+
+die() { echo "devbox-egress: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || [ -n "$ROOT" ] || die "$1 needs root: ssh root@devbox devbox-egress $1"; }
+# No mode file is a box not set up yet (off). Anything else unexpected stops
+# the command: a damaged file must never quietly mean "allow everything".
+mode() {
+	local m
+	[ -e "$MODE_FILE" ] || { echo off; return; }
+	m=$(cat "$MODE_FILE")
+	case "$m" in
+	audit | enforce | off) echo "$m" ;;
+	*) die "$MODE_FILE says '$m'; set the mode with devbox-egress audit|enforce|off" ;;
+	esac
+}
+
+# A CIDR may be no wider than /16 (IPv4) or /32 (IPv6): a wide one would
+# allow most of the internet through one line.
+valid_domain() { [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]] && [ ${#1} -le 253 ]; }
+valid_ip4() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/(1[6-9]|2[0-9]|3[0-2]))?$ ]]; }
+valid_ip6() {
+	[[ $1 =~ ^[0-9a-f:]*:[0-9a-f:]*(/([0-9]{1,3}))?$ ]] || return 1
+	[ -z "${BASH_REMATCH[2]}" ] || { [ "${BASH_REMATCH[2]}" -ge 32 ] && [ "${BASH_REMATCH[2]}" -le 128 ]; }
+}
+
+# One list on stdin, each entry lower-cased, comments and blanks dropped. A
+# line that is none of the three kinds stops the command: a typo must not
+# silently allow less (or more) than meant. $1 names the list in the error.
+clean() {
+	local line
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=${line%%#*}
+		line=$(tr -d '[:space:]' <<<"$line" | tr '[:upper:]' '[:lower:]')
+		[ -n "$line" ] || continue
+		valid_domain "$line" || valid_ip4 "$line" || valid_ip6 "$line" ||
+			die "$1: not a domain, address or CIDR: $line"
+		echo "$line"
+	done
+}
+# Every entry of both lists.
+entries() {
+	local f
+	for f in "$LIST" "$LOCAL"; do
+		[ -f "$f" ] || continue
+		clean "$f" <"$f"
+	done | sort -u
+}
+# Loaded once per command, so a bad line ends it here: a `die` inside a
+# pipeline or a process substitution would end only that subshell.
+ENTRIES=
+load() { ENTRIES=$(entries) || exit 1; }
+listed() { grep -qxF -- "$1" <<<"$ENTRIES"; }
+count() { grep -c . <<<"$ENTRIES" || true; }
+
+render_dns() {
+	local m=$1 d up
+	cat <<EOF
+# Written by devbox-egress apply ($m). Don't edit: change the lists.
+listen-address=$DNS_ADDR,$BRIDGE_ADDR
+bind-dynamic
+port=53
+user=$DNS_USER
+no-resolv
+no-hosts
+no-poll
+domain-needed
+bogus-priv
+cache-size=10000
+log-queries
+log-facility=$LOG
+# Tailnet names (containers ask here too).
+server=/ts.net/100.100.100.100
+EOF
+	while read -r d; do
+		valid_domain "$d" || continue
+		for up in "${UP_LISTED[@]}"; do echo "server=/$d/$up"; done
+		echo "nftset=/$d/4#inet#$TABLE#allow4,6#inet#$TABLE#allow6"
+	done <<<"$ENTRIES"
+	if [ "$m" = enforce ]; then
+		echo "address=/#/"
+	else
+		for up in "${UP_OTHER[@]}"; do echo "server=$up"; done
+	fi
+}
+
+render_nft() {
+	local m=$1 pub=$2 e ip4=() ip6=()
+	while read -r e; do
+		if valid_ip4 "$e"; then ip4+=("$e"); elif valid_ip6 "$e"; then ip6+=("$e"); fi
+	done <<<"$ENTRIES"
+	local IFS=,
+	cat <<EOF
+add table inet $TABLE
+add set inet $TABLE allow4 { type ipv4_addr; }
+add set inet $TABLE allow6 { type ipv6_addr; }
+add set inet $TABLE listed4 { type ipv4_addr; flags interval; auto-merge; }
+add set inet $TABLE listed6 { type ipv6_addr; flags interval; auto-merge; }
+flush set inet $TABLE listed4
+flush set inet $TABLE listed6
+EOF
+	[ ${#ip4[@]} -eq 0 ] || echo "add element inet $TABLE listed4 { ${ip4[*]} }"
+	[ ${#ip6[@]} -eq 0 ] || echo "add element inet $TABLE listed6 { ${ip6[*]} }"
+	unset IFS
+	cat <<EOF
+add chain inet $TABLE egress
+flush chain inet $TABLE egress
+add rule inet $TABLE egress ct state established,related accept
+add rule inet $TABLE egress meta mark and 0xff0000 == $TS_MARK accept
+add rule inet $TABLE egress ip daddr $DNS_ADDR meta l4proto { udp, tcp } th dport 53 accept
+add rule inet $TABLE egress ip6 daddr { fe80::/10, ff00::/8 } accept
+add rule inet $TABLE egress meta skuid $DNS_USER meta l4proto { udp, tcp } th dport 53 accept
+add rule inet $TABLE egress ip daddr @allow4 accept
+add rule inet $TABLE egress ip6 daddr @allow6 accept
+add rule inet $TABLE egress ip daddr @listed4 accept
+add rule inet $TABLE egress ip6 daddr @listed6 accept
+EOF
+	if [ "$m" = enforce ]; then
+		cat <<EOF
+add rule inet $TABLE egress limit rate 20/second log prefix "devbox-egress blocked: " level info
+add rule inet $TABLE egress meta l4proto tcp reject with tcp reset
+add rule inet $TABLE egress reject with icmpx admin-prohibited
+EOF
+	else
+		echo "add rule inet $TABLE egress limit rate 20/second log prefix \"devbox-egress would block: \" level info"
+	fi
+	cat <<EOF
+add chain inet $TABLE output { type filter hook output priority filter; policy accept; }
+flush chain inet $TABLE output
+add rule inet $TABLE output oifname "$pub" jump egress
+add chain inet $TABLE forward { type filter hook forward priority filter; policy accept; }
+flush chain inet $TABLE forward
+add rule inet $TABLE forward oifname "$pub" jump egress
+add chain inet $TABLE dns_out { type nat hook output priority dstnat; policy accept; }
+flush chain inet $TABLE dns_out
+add rule inet $TABLE dns_out oifname "$pub" meta skuid != $DNS_USER meta mark and 0xff0000 != $TS_MARK meta nfproto ipv4 meta l4proto { udp, tcp } th dport 53 dnat ip to $DNS_ADDR
+add chain inet $TABLE dns_in { type nat hook prerouting priority dstnat; policy accept; }
+flush chain inet $TABLE dns_in
+add rule inet $TABLE dns_in iifname "docker0" meta nfproto ipv4 meta l4proto { udp, tcp } th dport 53 dnat ip to $BRIDGE_ADDR
+add rule inet $TABLE dns_in iifname "br-*" meta nfproto ipv4 meta l4proto { udp, tcp } th dport 53 dnat ip to $BRIDGE_ADDR
+EOF
+}
+
+public_if() {
+	[ -n "${EGRESS_PUB:-}" ] && { echo "$EGRESS_PUB"; return; }
+	ip -o route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p'
+}
+
+# Answers for $1 (in audit, unlisted names must resolve too).
+resolves() {
+	local i
+	for i in 1 2 3 4 5; do
+		dig +short +time=2 +tries=1 @"$DNS_ADDR" "$1" A | grep -q . && return 0
+		sleep 1
+	done
+	return 1
+}
+dns_works() {
+	resolves github.com || return 1
+	[ "$1" = enforce ] || resolves example.org
+}
+
+apply() {
+	need_root apply
+	local m pub fresh=
+	m=$(mode)
+	if [ "$m" = off ]; then
+		nft list table inet $TABLE >/dev/null 2>&1 && nft delete table inet $TABLE
+		systemctl stop devbox-egress-dns.service 2>/dev/null || true
+		echo "egress: off"
+		return
+	fi
+	pub=$(public_if)
+	[ -n "$pub" ] || die "no public interface found"
+	load
+	install -d -m 755 "$(dirname "$LOG")"
+	[ -f "$LOG" ] || install -m 644 -o "$DNS_USER" /dev/null "$LOG"
+	render_dns "$m" >"$DNS_CONF.new"
+	dnsmasq --test -C "$DNS_CONF.new" >/dev/null 2>&1 || { dnsmasq --test -C "$DNS_CONF.new"; die "dnsmasq rejects the config"; }
+	mv "$DNS_CONF.new" "$DNS_CONF"
+	nft list table inet $TABLE >/dev/null 2>&1 || fresh=1
+	# The DNS server first, with the redirect not yet in place: if it doesn't
+	# answer, nothing has changed for the rest of the box.
+	nft "add table inet $TABLE; add set inet $TABLE allow4 { type ipv4_addr; }; add set inet $TABLE allow6 { type ipv6_addr; }"
+	systemctl restart devbox-egress-dns.service
+	if ! dns_works "$m"; then
+		[ -n "$fresh" ] && nft delete table inet $TABLE
+		die "the DNS server doesn't answer; egress left as it was (journalctl -u devbox-egress-dns)"
+	fi
+	# The dev user's agents read the log (blocked). dnsmasq resets its mode
+	# to 0660 once it is up (so after the check above), hence a named ACL
+	# entry, which a chmod leaves alone.
+	setfacl -m "u:$LOG_READER:r" "$LOG"
+	render_nft "$m" "$pub" | nft -f -
+	# A new table starts with empty sets: names cached anywhere would point
+	# at addresses it doesn't know yet.
+	[ -n "$fresh" ] && resolvectl flush-caches 2>/dev/null || true
+	echo "egress: $m on $pub, $(count) entries"
+}
+
+set_mode() {
+	need_root "$1"
+	install -d -m 755 "$STATE"
+	systemctl stop devbox-egress-revert.timer 2>/dev/null || true
+	systemctl reset-failed devbox-egress-revert.timer devbox-egress-revert.service 2>/dev/null || true
+	# The way back is armed before enforce goes live, so it exists even if
+	# what follows fails half-way.
+	if [ "$1" = enforce ]; then
+		systemd-run --quiet --unit=devbox-egress-revert --on-active=5min \
+			/usr/local/sbin/devbox-egress audit || die "can't arm the revert timer; mode unchanged"
+	fi
+	echo "$1" >"$MODE_FILE"
+	apply
+	if [ "$1" = enforce ]; then
+		echo "Enforcing. Check the box still works, then: devbox-egress confirm"
+		echo "(back to audit in 5 minutes without it)"
+	fi
+}
+
+allow() {
+	need_root allow
+	local e
+	[ $# -gt 0 ] || die "usage: devbox-egress allow <domain|ip|cidr>…"
+	install -d -m 755 "$STATE"
+	for e in "$@"; do
+		e=$(tr '[:upper:]' '[:lower:]' <<<"$e")
+		valid_domain "$e" || valid_ip4 "$e" || valid_ip6 "$e" || die "not a domain, address or CIDR: $e"
+		listed "$e" && { echo "already listed: $e"; continue; }
+		echo "$e" >>"$LOCAL"
+		ENTRIES+=$'\n'$e
+		echo "allowed: $e"
+	done
+	local m
+	m=$(mode)
+	[ "$m" = off ] || apply
+}
+
+# Requests come from the dev user, so the queue is untrusted: each line is
+# checked again when it is read.
+request() {
+	local d=${1:-} why=${2:-}
+	d=$(tr '[:upper:]' '[:lower:]' <<<"$d")
+	valid_domain "$d" || die "usage: devbox-egress request <domain> <why> (a domain like registry.npmjs.org)"
+	[ -n "$why" ] || die "say why the domain is needed"
+	listed "$d" && { echo "$d is already allowed"; return; }
+	why=$(tr '\t' ' ' <<<"$why" | tr -cd '[:print:]' | cut -c1-200)
+	printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$d" "$why" >>"$REQUESTS"
+	echo "Requested $d. The user approves it with: ssh -t root@devbox devbox-egress approve"
+}
+
+# The queue's directory is the dev user's, so `queue` can be anything they
+# put there, a link to another file included: only a regular file is read.
+pending_lines() {
+	local q=${1:-$REQUESTS} t d why
+	[ -f "$q" ] && [ ! -L "$q" ] || return 0
+	while IFS=$'\t' read -r t d why; do
+		valid_domain "$d" || continue
+		listed "$d" && continue
+		printf '%s\t%s\t%s\n' "$t" "$d" "$(tr -cd '[:print:]' <<<"$why" | cut -c1-200)"
+	done <"$q" | sort -t$'\t' -k2,2 -u
+}
+
+pending() {
+	local t d why n=0
+	while IFS=$'\t' read -r t d why; do
+		echo "$d   ($t) $why"; n=$((n + 1))
+	done < <(pending_lines)
+	[ $n -gt 0 ] || echo "no requests"
+}
+
+approve() {
+	need_root approve
+	local t d why a added=() taken=$STATE/requests.taken new=$STATE/requests.new
+	exec 3<"${EGRESS_TTY:-/dev/tty}"
+	# Root never writes into the dev user's directory. The queue is moved out
+	# of it into root's own (a rename moves a link or a directory, not what it
+	# points to or holds), and a request made meanwhile starts a new queue
+	# rather than being lost. Only a regular file is kept; anything else is
+	# removed (rm -r doesn't follow links). Requests left unanswered by an
+	# interrupted approve are still in requests.taken and come round again.
+	install -d -m 755 "$STATE"
+	plain() { [ -f "$1" ] && [ ! -L "$1" ]; }
+	plain "$taken" || rm -rf -- "$taken"
+	rm -rf -- "$new"
+	if mv -- "$REQUESTS" "$new" 2>/dev/null; then
+		if plain "$new"; then cat -- "$new" >>"$taken"; else echo "the queue wasn't a plain file; removed it"; fi
+		rm -rf -- "$new"
+	fi
+	plain "$taken" || { echo "no requests"; return; }
+	while IFS=$'\t' read -r t d why; do
+		printf '%s\n  asked %s: %s\nAllow? [y/N] ' "$d" "$t" "$why"
+		read -r a <&3 || a=
+		[[ $a == [yY]* ]] && added+=("$d")
+	done < <(pending_lines "$taken")
+	rm -f -- "$taken"
+	[ ${#added[@]} -eq 0 ] || allow "${added[@]}"
+	[ ${#added[@]} -gt 0 ] || echo "nothing allowed"
+}
+
+# Names asked for that aren't listed: in enforce they got NXDOMAIN, in audit
+# they went to the other resolvers.
+blocked() {
+	local n=${1:-20} other
+	other=$(IFS='|'; echo "${UP_OTHER[*]}")
+	[ -r "$LOG" ] || die "no log yet ($LOG)"
+	{ cat "$LOG.1" 2>/dev/null || true; cat "$LOG"; } |
+		sed -nE "s/.* config ([^ ]+) is NXDOMAIN$/\1/p; s/.* forwarded ([^ ]+) to (${other//./\\.})$/\1/p" |
+		awk '{ last[$0] = NR } END { for (d in last) print last[d], d }' |
+		sort -n | tail -n "$n" | cut -d' ' -f2-
+}
+
+status() {
+	local m own=0
+	m=$(mode)
+	echo "mode: $m"
+	[ -f "$LOCAL" ] && own=$(grep -cvE '^[[:space:]]*(#|$)' "$LOCAL" || true)
+	echo "listed: $(count) entries ($own added on the box; make egress-sync brings them to the repo)"
+	echo "requests: $(pending_lines | wc -l | tr -d ' ')"
+	systemctl is-active --quiet devbox-egress-revert.timer 2>/dev/null &&
+		echo "enforce is on trial: back to audit soon unless devbox-egress confirm"
+	return 0
+}
+
+# The repo's list on stdin; prints what the box added that it doesn't have.
+unsynced() {
+	local repo own
+	repo=$(clean "the repo's egress.allow") || exit 1
+	[ -f "$LOCAL" ] || return 0
+	own=$(clean "$LOCAL" <"$LOCAL") || exit 1
+	comm -23 <(sort -u <<<"$own") <(sort -u <<<"$repo")
+}
+
+load
+case "${1:-status}" in
+status) status ;;
+blocked) blocked "${2:-20}" ;;
+request) shift; request "$@" ;;
+pending) pending ;;
+approve) approve ;;
+allow) shift; allow "$@" ;;
+audit | enforce | off) set_mode "$1" ;;
+confirm) need_root confirm; systemctl stop devbox-egress-revert.timer 2>/dev/null || true; echo "enforce kept" ;;
+apply) apply ;;
+render)
+	case "${2:-}" in
+	dns) render_dns "${3:-$(mode)}" ;;
+	nft) render_nft "${3:-$(mode)}" "$(public_if)" ;;
+	*) die "usage: devbox-egress render dns|nft [mode]" ;;
+	esac
+	;;
+unsynced) unsynced ;;
+*) grep '^#   devbox-egress' "$0" | cut -c5- >&2; exit 2 ;;
+esac

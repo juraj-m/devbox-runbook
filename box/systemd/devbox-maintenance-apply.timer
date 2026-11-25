@@ -1,0 +1,9 @@
+[Unit]
+Description=Hourly: run due devbox maintenance if the box is idle
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target
